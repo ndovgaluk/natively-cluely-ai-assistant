@@ -23,7 +23,7 @@
 
 import type { AnswerType } from './AnswerPlanner';
 import {
-  analyzeUserInstructions, hasFactSignature, isDirectiveShaped, isFirstPersonFact,
+  analyzeUserInstructions, hasFactSignature, isBareLanguageName, isDirectiveShaped, isFirstPersonFact,
   parseInstructionLines, splitInstructionClauses, USER_INSTRUCTIONS_MAX_CHARS,
 } from './userInstructionContract';
 
@@ -84,7 +84,37 @@ const MONEY_AMOUNT_RE =
   // every live turn. No real amount is longer than 25 characters.
   /(?:[$₹€£]\s?\d[\d,.]{0,24}|(?<![\w.,])\d[\d,.]{0,24}\s?(?:k\b|m\b|mm\b|lpa\b|lakhs?\b|cr\b|crores?\b|usd\b|inr\b|million\b|\/(?:seat|user|month|mo|year|yr|seat\/mo)))/i;
 
-const isSensitive = (chunk: string): boolean => SENSITIVE_RE.test(chunk) || MONEY_AMOUNT_RE.test(chunk);
+// Words that make a figure pay: "I make 500k pesos a year", "my offer is 300k
+// dirhams". A sentence with one of these never has its figures read as counts.
+const EARNINGS_RE = /\b(?:make|makes|making|made\s+\$|earn\w*|paid|pay|payout|package|offer\w*|raise|hike|per\s+(?:year|annum|month|hour)|a\s+year|\/(?:yr|year|mo|month|hr|hour))\b/i;
+
+// A number with a k/M/million unit and no currency sign is a COUNT when a counted
+// noun follows it: "about 40M deliveries a day", "100k users", "5M downloads"
+// (#744). "185k base", "320k TC", "2m per year" are still amounts. Plurals that
+// are money ("50k shares", "10k dollars", "300k dirhams") stay amounts, and so
+// does any figure in a sentence about pay (EARNINGS_RE).
+const COUNT_UNIT_RE = /(?<![\w.,$₹€£])\d[\d,.]{0,24}\s?(?:k|m|mm|million)\s+([A-Za-z][A-Za-z-]*)/gi;
+const MONEY_PLURAL_RE = /^(?:dollars|bucks|rupees|euros|pounds|pesos|dirhams|riyals|rials|francs|rands|reais|ringgits|rupiahs|lire|liras|kronas|kronor|kroner|zlotys|dinars|shekels|nairas|cedis|shillings|takas|bahts|dongs|wons|yuans|renminbis|quids|grand|shares|units|options|grants|rsus|credits|coins|tokens|points)$/i;
+const isCountedNoun = (word: string): boolean => /^[a-z][a-z-]*[a-z]s$/i.test(word) && !MONEY_PLURAL_RE.test(word);
+const hasMoneyAmount = (text: string): boolean => {
+  if (!MONEY_AMOUNT_RE.test(text)) return false;
+  if (EARNINGS_RE.test(text)) return true;
+  // Remove the counts, then look again: anything left is an amount.
+  const withoutCounts = text.replace(COUNT_UNIT_RE, (m: string, noun: string) => (isCountedNoun(noun) ? ` ${noun}` : m));
+  return MONEY_AMOUNT_RE.test(withoutCounts);
+};
+
+const isSensitive = (chunk: string): boolean => SENSITIVE_RE.test(chunk) || hasMoneyAmount(chunk);
+
+// A dollar figure inside an incident story is history, not pricing: "a flag
+// misconfiguration double-applied promo codes (about 1,200 orders, $9k); I rolled
+// back and ran the postmortem" is the user's failure story, and gating it to
+// negotiation answers left every behavioural answer without it (#744). Only a
+// SENTENCE qualifies, never a whole chunk, so a salary sentence beside it is
+// still withheld; and only when nothing in it names pay, pricing or strategy.
+const INCIDENT_RE = /\b(?:incident|outage|post-?mortem|rolled\s+(?:it\s+)?back|roll-?back|misconfigur\w*|root\s+cause|downtime|sev[- ]?[0-4]|hotfix(?:ed)?|double-(?:applied|charged|billed|counted|sent)|refund(?:ed|s)?)\b/i;
+const isIncidentCost = (sentence: string): boolean =>
+  INCIDENT_RE.test(sentence) && !SENSITIVE_RE.test(sentence) && !EARNINGS_RE.test(sentence);
 
 // ── A PROTECTIVE INSTRUCTION IS NOT SENSITIVE DATA (2026-09-21) ─────────────
 //
@@ -115,7 +145,7 @@ const carriesDataSignal = (t: string): boolean =>
 const isProtectiveInstruction = (sentence: string): boolean =>
   isSensitive(sentence) && !carriesDataSignal(sentence) && splitInstructionClauses(sentence).some(isDirectiveShaped);
 /** One sentence carries sensitive DATA (as opposed to merely naming a sensitive topic in a rule). */
-const isSensitiveSentence = (sentence: string): boolean => isSensitive(sentence) && !isProtectiveInstruction(sentence);
+const isSensitiveSentence = (sentence: string): boolean => isSensitive(sentence) && !isProtectiveInstruction(sentence) && !isIncidentCost(sentence);
 /** Any sentence of the text carries sensitive data. A text whose sensitivity only shows ACROSS sentences counts too. */
 const hasSensitiveData = (text: string): boolean => {
   if (!isSensitive(text)) return false;
@@ -304,6 +334,10 @@ const carriesContent = (t: string): boolean =>
 const isDirectiveSentence = (text: string, lenient = true): boolean => {
   const t = (text || '').trim();
   if (!t || t.length > FORMAT_DIRECTIVE_SENTENCE_MAX_CHARS || carriesContent(t)) return false;
+  // A bare language name cut out of a sentence is an item of what it was cut
+  // from: "Python 7 years (main), Java 3, some Go" gave up "Java 3", and every
+  // coding turn was told "Write ALL code in Java" (issue #740).
+  if (!lenient && isBareLanguageName(t)) return false;
   const a = analyzeUserInstructions(t);
   if (a.length || a.bindsProgrammingLanguage || a.layout) return true;
   if (isDirectiveShaped(t)) return true;
@@ -567,6 +601,51 @@ export const selectCustomContextForAnswer = (
   }
 
   return { included: inSourceOrder(included), excluded, sensitiveIncluded };
+};
+
+// Answer types whose answer is a self-contained technical artifact. The user's
+// own facts (who they are, where they work) have no place in a solution or an
+// explanation of a concept, so none ride. identity_answer is deliberately NOT
+// here: "tell me about yourself" is exactly the question those facts answer.
+// Derived, not copied: an answer type added to CUSTOM_CONTEXT_FORBIDDEN_TYPES
+// (as technical_concept_answer was on 2026-08-22) is forbidden here too.
+const SELF_FACTS_FORBIDDEN_TYPES: ReadonlySet<AnswerType> = new Set<AnswerType>(
+  [...CUSTOM_CONTEXT_FORBIDDEN_TYPES].filter((t) => t !== 'identity_answer'),
+);
+/** For callers outside the classifier (the personal-context reader). */
+export const isSelfFactsForbiddenType = (t?: AnswerType | null): boolean => Boolean(t && SELF_FACTS_FORBIDDEN_TYPES.has(t));
+
+/**
+ * The FACTS the user wrote in a mode's Real-time prompt ("I'm Paolo, a backend
+ * engineer from Cebu", "We sell to dental clinics"), for the prompt's
+ * "notes the user wrote" data section (2026-11-09).
+ *
+ * The instruction channel carries only presentation, and tells the model to
+ * treat any fact in it as no instruction at all; with nothing else carrying
+ * them, a user's own background never reached an answer and "where are you
+ * from?" was answered with an invented one (a 1★ review: "it literally says im
+ * from india when im from ph"). These are the user's own words about
+ * themselves, the same class as About you, so they ride as data.
+ *
+ * Same gates as the rest of the text: sensitive sentences (salary, pricing,
+ * strategy) only for the answer types allowed them, and nothing for technical
+ * artifacts. With no answer type, sensitive sentences stay out.
+ */
+export const selectCustomContextFactsForAnswer = (
+  classified: ClassifiedCustomContext,
+  answerType?: AnswerType,
+): CustomContextChunk[] => {
+  if (answerType && SELF_FACTS_FORBIDDEN_TYPES.has(answerType)) return [];
+  // NOT by category: `pinned` means SHORT, and "I'm Paolo, a backend engineer
+  // from Cebu City." is short. The instruction detector the identity gate uses
+  // decides instead: a chunk that is wholly an instruction stays out (it rides
+  // the instruction block); anything with a fact in it rides here.
+  const formatContext = classified.definesAnswerFormat ?? false;
+  const wholeInstruction = (t: string) =>
+    extractInstructionText(t, formatContext) === parseInstructionLines(t).map(l => l.line).join('\n');
+  const chunks: CustomContextChunk[] = [...classified.pinned, ...classified.searchable].filter(c => !wholeInstruction(c.text));
+  if (answerType && SENSITIVE_ALLOWED_TYPES.has(answerType)) chunks.push(...classified.sensitive);
+  return inSourceOrder(chunks);
 };
 
 /**

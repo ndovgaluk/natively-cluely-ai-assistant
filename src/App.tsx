@@ -19,6 +19,8 @@ import type { TrialUsage, TrialLimits } from './types/nativelyUsage';
 import { FreeTrialModal }       from "./components/trial/FreeTrialModal"
 import { usageForEndedCard }    from "./lib/trial/endedTrialUsage.mjs"
 import { OrchestratorProvider, OrchestratedToasterHost, setUserState as setOrchestratorUserState, emitOrchestratorEvent } from "./components/onboarding/OrchestratedToasterHost"
+import { LauncherGuide } from "./components/guide/LauncherGuide"
+import { dispatchGuide, useGuide } from "./components/guide/useGuide"
 // NOTE: explicit `.ts` extension is load-bearing. Vite's default resolver
 // tries `.mjs` before `.ts` (see DEFAULT_EXTENSIONS in vite/dist/node/constants.js),
 // and this directory also has an `orchestrator.mjs` companion (kept for
@@ -36,7 +38,7 @@ import { savedMeetingAudio } from "./lib/startMeetingRequest"
 import { ProviderChangeNotice, type EmbeddingDegradedNotice } from "./components/ProviderChangeNotice"
 import { clampOverlayOpacity, OVERLAY_OPACITY_DEFAULT, getDefaultOverlayOpacity } from "./lib/overlayAppearance"
 import { getMeetingInterfaceTheme, resolveMeetingInterfaceTheme, type MeetingInterfaceTheme } from './lib/meetingInterfaceTheme'
-import { permissionsNeedAttention } from './lib/permissionAttentionPolicy.mjs'
+import { requiredPermissionsGranted, startupPermissionsAttention } from './lib/permissionsCardPolicy.mjs'
 import { collectRendererLegacy } from './lib/cards/rendererLegacy.mjs'
 import { resetRendererTrialClaim } from './lib/trialCampaign.mjs'
 import { cardInputsFromSources } from './lib/cards/cardInputs.mjs'
@@ -301,6 +303,11 @@ const App: React.FC = () => {
   // motion, the launcher keeps its plain fade-up instead.
   const cameFromWelcome = useRef(false);
   if (showWelcome) cameFromWelcome.current = true;
+  // The first-run Welcome happened this launch: the permissions card may be
+  // followed by one more card (src/lib/onboarding/launchSession.mjs).
+  useEffect(() => {
+    if (showWelcome && (isLauncherWindow || isDefault)) setOrchestratorUserState({ welcomeThisLaunch: true });
+  }, [showWelcome, isLauncherWindow, isDefault]);
   const launcherLands = !cameFromWelcome.current && !reduceManagerMotion;
   const launcherLanded = useRef(false);
   const landLauncher = useCallback((el: HTMLDivElement | null) => {
@@ -350,6 +357,11 @@ const App: React.FC = () => {
   const openLauncherMeeting = useCallback((id: string) => {
     setIsSettingsOpen(false);
     setLauncherRequest({ kind: 'meeting', id, seq: Date.now() });
+  }, []);
+  // The first-run guide's step 8: Settings closed, the Launcher back on Home.
+  const openLauncherHome = useCallback(() => {
+    setIsSettingsOpen(false);
+    setLauncherRequest({ kind: 'home', seq: Date.now() });
   }, []);
   // The notes window's "Open meeting" after Stop (main sends it to the launcher only).
   useEffect(() => {
@@ -519,6 +531,33 @@ const App: React.FC = () => {
     [orch],
   );
   const orchState = useSyncExternalStore(orchSubscribe, orchSnapshot);
+  // The update card is a full-window card too (2026-11-09): it opens only when
+  // nothing else holds the screen, and while open it holds the card
+  // scheduler's one slot, so no onboarding card opens over it.
+  const updateCardMayOpen = !showStartup && showWelcome === false && !isSettingsOpen && !isManagerOpen
+    && !showTrialExpiredModal && !trialEndedDue && !orchState?.activeToasterId;
+  const claimUpdateSlot = useCallback((force?: boolean) => (orch ? orch.claimExternalCard('update', { force }) : true), [orch]);
+  const releaseUpdateSlot = useCallback(() => { orch?.releaseExternalCard('update'); }, [orch]);
+  // First-run guide (components/guide/LauncherGuide.tsx). While it runs it holds
+  // the card slot, so no other card opens over it, and the trial-ended card
+  // waits: the guide jumps to its plans step, which says the same thing in
+  // place. The card is only deferred, so it still opens if the guide ends
+  // with the trial still over.
+  const guide = useGuide();
+  const guideHoldsScreen = (isLauncherWindow || isDefault) && guide.state?.status === 'active';
+  useEffect(() => {
+    if (!orch || !guideHoldsScreen) return;
+    // The slot may be taken (an update card, or the trial-ended flag not yet
+    // cleared): keep asking each time the orchestrator changes until it is ours.
+    let held = orch.claimExternalCard('first_run_guide', { force: true });
+    const off = held ? undefined : orch.subscribe(() => {
+      if (!held) held = orch.claimExternalCard('first_run_guide', { force: true });
+    });
+    return () => { off?.(); orch.releaseExternalCard('first_run_guide'); };
+  }, [orch, guideHoldsScreen]);
+  useEffect(() => {
+    if (guideHoldsScreen && (showTrialExpiredModal || trialEndedDue)) dispatchGuide({ type: 'trial_out' });
+  }, [guideHoldsScreen, showTrialExpiredModal, trialEndedDue]);
   // ── Card scheduler inputs (toaster policy) ──────────────────────────────
   // What decides which card is relevant (keys, plan, profile, JD, trial,
   // extension, quota) is read live and re-read whenever it can have changed;
@@ -598,8 +637,8 @@ const App: React.FC = () => {
   // The Trial ended card owns the screen while it is open.
   useEffect(() => {
     if (!isLauncherWindow && !isDefault) return;
-    setOrchestratorUserState({ trialEndedOpen: showTrialExpiredModal || trialEndedDue });
-  }, [showTrialExpiredModal, trialEndedDue, isLauncherWindow, isDefault]);
+    setOrchestratorUserState({ trialEndedOpen: (showTrialExpiredModal || trialEndedDue) && !guideHoldsScreen });
+  }, [showTrialExpiredModal, trialEndedDue, guideHoldsScreen, isLauncherWindow, isDefault]);
 
   // Start the onboarding orchestrator (launcher window only). Stages are
   // registered lazily; the drain loop only runs while foreground + homepage
@@ -916,10 +955,20 @@ const App: React.FC = () => {
 
       const maybeCheck = window.electronAPI?.checkPermissions;
       if (maybeCheck) {
+        // How often the card was closed while a permission was still missing
+        // (permissionsCardPolicy.mjs): it waits 7 days after a close and stops
+        // coming back at launch after the third. Read alongside the check; an
+        // unreadable record counts as never closed.
+        const cardRecord = Promise.resolve(window.electronAPI?.permissionsCardGet?.()).catch(() => null);
         maybeCheck()
-          .then((p) => {
+          .then(async (p) => {
+            const record = await cardRecord;
+            // Everything granted: a permission that breaks later starts afresh.
+            if (requiredPermissionsGranted(p) && record && record.dismissals > 0) {
+              window.electronAPI?.permissionsCardRecord?.('granted')?.catch?.(() => {});
+            }
             setOrchestratorUserState({
-              permissionsNeedAttention: permissionsNeedAttention(p),
+              permissionsNeedAttention: startupPermissionsAttention(p, record, Date.now()),
               extensionSupported: true, // updated by phoneMirrorGetInfo below
             });
           })
@@ -1163,8 +1212,10 @@ const App: React.FC = () => {
         // the "I press Start Natively and nothing happens" report.
         if (result.code === 'mic-permission-denied') {
           // Route through the orchestrator: mark permissions as needing
-          // attention so the permissions stage becomes re-eligible.
-          setOrchestratorUserState({ permissionsNeedAttention: true });
+          // attention so the permissions stage becomes re-eligible. The user
+          // asked for a meeting, so neither a put-off card nor this launch's
+          // one-card limit holds it back.
+          setOrchestratorUserState({ permissionsNeedAttention: true, permissionsRecoveryRequested: true });
         }
       }
     } catch (err) {
@@ -1175,7 +1226,7 @@ const App: React.FC = () => {
       // serialized error .code across ipcRenderer.invoke — keep the recovery
       // working so the denial never regresses to a silent failure.
       if ((err as { code?: string })?.code === 'mic-permission-denied') {
-        setOrchestratorUserState({ permissionsNeedAttention: true });
+        setOrchestratorUserState({ permissionsNeedAttention: true, permissionsRecoveryRequested: true });
       }
     }
   };
@@ -1529,7 +1580,7 @@ const App: React.FC = () => {
       />
 
       <div data-opacity-preview-surface="">
-        {!isolateGlobalSurfaces && <UpdateBanner />}
+        {!isolateGlobalSurfaces && <UpdateBanner canOpen={updateCardMayOpen} claimSlot={claimUpdateSlot} releaseSlot={releaseUpdateSlot} />}
         {!isolateGlobalSurfaces && <NativelyQuotaBanner />}
         {/* A call was detected: Start / Not now, and the countdown when Start automatically is on. */}
         {!isolateGlobalSurfaces && (isLauncherWindow || isDefault) && <MeetingOfferToast />}
@@ -1543,10 +1594,14 @@ const App: React.FC = () => {
             <OrchestratedToasterHost onOpenSettings={openSettingsExclusive} onOpenProfile={openProfileExclusive} />
           </OrchestratorProvider>
         )}
+        {/* The first-run guide's launcher steps (1 and 5), after the Plans card. */}
+        {!isolateOnboarding && showWelcome === false && (isLauncherWindow || isDefault) && (
+          <LauncherGuide onOpenSettings={openSettingsExclusive} onOpenMeeting={openLauncherMeeting} onShowHome={openLauncherHome} />
+        )}
 
 
         {/* Post-trial upgrade modal — shown when trial expires */}
-        {!isolateModals && (isLauncherWindow || isDefault) && showTrialExpiredModal && (
+        {!isolateModals && (isLauncherWindow || isDefault) && showTrialExpiredModal && !guideHoldsScreen && (
           <FreeTrialModal
             // activeTrial is already cleared when the card opens: the last
             // figures seen, never zeros (src/lib/trial/endedTrialUsage.mjs).

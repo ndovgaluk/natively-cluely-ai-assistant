@@ -12,6 +12,10 @@ import { normalizeMeetingSurface } from './utils/meetingSurface';
 import { openInNotepadBlockReason, resumeBlockReason } from './services/meeting/meetingResume';
 import { micSettingsUri } from '../src/lib/micPermissionPolicy.mjs';
 import { resolveMacScreenStatus } from '../src/lib/permissionAttentionPolicy.mjs';
+import { applyPermissionsCardEvent, normalizePermissionsCardRecord } from '../src/lib/permissionsCardPolicy.mjs';
+import { guideFactsFromSources } from '../src/lib/onboarding/firstRunGuide.mjs';
+import { configureGuideStore, dispatchGuideFromWindow, getGuideState, guideScreenshotTaken, guideStopLockedMs, guideSurfaceSet } from './services/firstRunGuideStore';
+import { DEMO_VIDEO_URL, demoFilmOpenOptions } from '../src/lib/demoVideoUrl';
 import { hasOwnAiKey, resolveExpiredTrial } from '../src/lib/trialPolicy.mjs';
 import { CARDS, OUTCOMES } from '../src/lib/cards/cardPolicy.mjs';
 import { TRIAL_CAMPAIGN, TRIAL_PROMO_ID, runTrialCampaignReset } from '../src/lib/trialCampaign.mjs';
@@ -334,6 +338,24 @@ let appleSpeechLocalesCache: { available: boolean; supported: string[]; installe
 /** The running licence re-check schedule (services/licenceRecheck.ts), once IPC is up. */
 let licenceRecheck: import('./services/licenceRecheck').LicenceRecheck | null = null;
 let proWatchTimer: ReturnType<typeof setInterval> | null = null;
+/**
+ * Re-read Pro now instead of at the next 30 s watch. Called after the AI model
+ * or the speech-to-text provider changes: a Pro pack's Pro follows both
+ * (services/packs/packProRule.ts). A no-op until the Pro watch exists.
+ */
+let checkProNow: () => void = () => {};
+
+/** The licence as the windows are told it (the Pro pack rule applied). */
+function licencePremiumForWindows(): boolean {
+  try {
+    const { isLicencePremium, forgetLicenceFacts } = require('./services/proAccess') as typeof import('./services/proAccess');
+    // Windows are told after an activation or a re-check: read the licence fresh.
+    forgetLicenceFacts();
+    return isLicencePremium();
+  } catch {
+    return false;
+  }
+}
 
 /** Ask the licence server now (wake from sleep, a usage read without Pro); spaced and single-flight. */
 export function triggerLicenceRecheck(reason: import('./services/licenceRecheck').RecheckReason): void {
@@ -341,12 +363,20 @@ export function triggerLicenceRecheck(reason: import('./services/licenceRecheck'
 }
 
 export function initializeIpcHandlers(appState: AppState): void {
+  // Each handler as registered, so main can run the very flow a window asks
+  // for (the Pro pack restore re-selects a mode through modes:set-active).
+  const registeredHandlers = new Map<string, (event: any, ...args: any[]) => any>();
   const safeHandle = (
     channel: string,
     listener: (event: any, ...args: any[]) => Promise<any> | any,
   ) => {
     ipcMain.removeHandler(channel);
     ipcMain.handle(channel, listener);
+    registeredHandlers.set(channel, listener);
+  };
+  const applyActiveMode = async (id: string | null): Promise<any> => {
+    const handler = registeredHandlers.get('modes:set-active');
+    return handler ? handler(null, id) : { success: false, error: 'not_ready' };
   };
 
   const safeOn = (
@@ -736,7 +766,37 @@ export function initializeIpcHandlers(appState: AppState): void {
    * server, have it refused, and call revertNativelyAutoDefaults() — undoing the
    * promotion this exists to apply.
    */
+  /**
+   * Hand the embedder the Natively credential that is stored NOW.
+   *
+   * NativelyEmbeddingProvider captures its key at construction, and nothing on
+   * the key paths rebuilt it — only boot, a Gemini/OpenAI key save and the
+   * Ollama pull did. So a customer who upgraded mid-meeting (Pro key cancelled,
+   * Ultra key pasted) kept embedding with the cancelled key: every /v1/embed
+   * answered 403 subscription_inactive, once a minute, and meeting memory and
+   * reference-file retrieval were dark until the app restarted (2026-11-16, 80+
+   * minutes of 403s from one Ultra customer).
+   *
+   * Cheap to call: EmbeddingPipeline.initialize() re-resolves only when
+   * embeddingConfigChanged() says an input moved (the key, the trial token).
+   */
+  const refreshNativelyEmbeddings = (reason: string): void => {
+    try {
+      const ragManager = appState.getRAGManager?.();
+      if (!ragManager) return;
+      ragManager.initializeEmbeddings(buildEmbeddingConfig())
+        .then(() => {
+          appState.scheduleModeReferenceIndexRetry?.();
+          return ragManager.retryPendingEmbeddings?.();
+        })
+        .catch((e: any) => console.warn(`[IPC] embeddings refresh after ${reason} failed:`, e?.message));
+    } catch (e: any) {
+      console.warn(`[IPC] embeddings refresh after ${reason} failed:`, e?.message);
+    }
+  };
+
   const syncNativelyModelRuntime = (): void => {
+    refreshNativelyEmbeddings('Natively credential change');
     try {
       const { CredentialsManager } = require('./services/CredentialsManager');
       const cm = CredentialsManager.getInstance();
@@ -1032,6 +1092,8 @@ export function initializeIpcHandlers(appState: AppState): void {
       if (cm.getDefaultModel() !== defaultModel) return null;
       cm.setDefaultModel(next);
       llmHelper.setModel(next, allProviders);
+      // A Pro pack's Pro follows the AI and speech-to-text (packs/packProRule.ts).
+      checkProNow();
       // Same two listeners as every other model change. Converted alongside the
       // rest rather than left as the one surviving broadcast — an untargeted
       // straggler is how this class of fix keeps coming back.
@@ -1081,6 +1143,16 @@ export function initializeIpcHandlers(appState: AppState): void {
   } catch (e: any) {
     console.warn('[IPC] Pro check for modes not wired:', e?.message || e);
   }
+  // The Answer length (Settings › Overlay) the length planner reads each turn
+  // (llm/answerLength.ts). Pro is checked on every read, like the modes above,
+  // so a lapsed licence answers at Smart at once.
+  try {
+    const { registerAnswerLengthProvider, effectiveAnswerLength } = require('./llm/answerLength') as typeof import('./llm/answerLength');
+    registerAnswerLengthProvider(() =>
+      effectiveAnswerLength(SettingsManager.getInstance().get('answerLength'), isProOrTrialActive()));
+  } catch (e: any) {
+    console.warn('[IPC] Answer length not wired, answers stay Smart:', e?.message || e);
+  }
   try {
     const { KnowledgeOrchestrator } = require('../premium/electron/knowledge/KnowledgeOrchestrator');
     KnowledgeOrchestrator.setProAccessCheck(isProOrTrialActive);
@@ -1121,8 +1193,13 @@ export function initializeIpcHandlers(appState: AppState): void {
    * (recheckLicence skips the stand-down then) is stood down once the trial
    * goes, whichever way it goes. Returns whether anything changed. Never throws.
    */
+  // True while a pack in use takes Pro over from a plan whose licence just went
+  // (runLicenceRecheck's onLost): Pro is off for those few seconds, and a stand-
+  // down then would switch off what the pack's Pro keeps (2026-11-18).
+  let packTakingOverPro = false;
   const standDownIfNoPro = (reason: string): boolean => {
     try {
+      if (packTakingOverPro) return false;
       if (isProOrTrialActive()) return false;
       let changed = false;
       try {
@@ -1136,6 +1213,17 @@ export function initializeIpcHandlers(appState: AppState): void {
       try {
         const { ModesManager, modeNeedsPro } = require('./services/ModesManager') as typeof import('./services/ModesManager');
         if (modeNeedsPro(ModesManager.getInstance().getStoredActiveMode())) {
+          const stored = ModesManager.getInstance().getStoredActiveMode();
+          // A Pro pack's Pro went off because the AI or speech-to-text moved
+          // off Natively API: remember the mode, so switching back puts it
+          // back (restorePackStandDown). Used once, the next time Pro is back.
+          try {
+            const { currentPackProBlock } = require('./services/proAccess') as typeof import('./services/proAccess');
+            const { SettingsManager } = require('./services/SettingsManager');
+            // Pro lost any other way (the pack ran out, a plan lapsed): nothing
+            // is put back later, so a stale mode cannot return weeks on.
+            SettingsManager.getInstance().set('packProStandDownModeId', stored?.id && currentPackProBlock() !== null ? stored.id : null);
+          } catch { /* the mode is not put back: the user picks it again */ }
           clearActiveModeOnLicenseLoss();
           changed = true;
         }
@@ -1143,6 +1231,44 @@ export function initializeIpcHandlers(appState: AppState): void {
       return changed;
     } catch {
       return false;
+    }
+  };
+
+  /**
+   * Pro is back: put back what standDownIfNoPro switched off, so a Pro pack
+   * owner who moved the AI or speech-to-text off Natively API and back finds
+   * things as they left them (2026-11-16).
+   *   - Profile Intelligence: its saved setting is never cleared by a stand-down,
+   *     only the live switch; launch restores it from the setting when Pro is
+   *     there (main.ts), and this does the same without a relaunch. A user who
+   *     switched it off themselves saved false, so it stays off.
+   *   - The Pro mode: put back only when the pack rule cleared it and no mode
+   *     was picked since, through the same flow as the mode picker.
+   * Never throws.
+   */
+  const restorePackStandDown = async (): Promise<void> => {
+    try {
+      const { restoreAfterPackStandDown } = require('./services/packs/packProRule') as typeof import('./services/packs/packProRule');
+      const { SettingsManager } = require('./services/SettingsManager');
+      const { ModesManager } = require('./services/ModesManager') as typeof import('./services/ModesManager');
+      const sm = SettingsManager.getInstance();
+      const mm = ModesManager.getInstance();
+      const orchestrator = appState.getKnowledgeOrchestrator();
+      const done = await restoreAfterPackStandDown({
+        proActive: isProOrTrialActive,
+        packLicence: () => (require('./services/proAccess') as typeof import('./services/proAccess')).licenceIsPack(),
+        knowledgeSetting: () => sm.get('knowledgeMode'),
+        knowledgeSwitchedOn: () => Boolean(orchestrator?.isKnowledgeModeSwitchedOn?.()),
+        setKnowledge: (on) => orchestrator?.setKnowledgeMode(on),
+        savedModeId: () => sm.get('packProStandDownModeId'),
+        clearSavedModeId: () => { sm.set('packProStandDownModeId', null); },
+        activeModeId: () => mm.getStoredActiveMode()?.id ?? null,
+        modeExists: (id) => mm.getModes().some((m: any) => m.id === id),
+        applyMode: (id) => applyActiveMode(id),
+      });
+      if (done.knowledge || done.modeId) console.log(`[IPC] Pro is back: Profile Intelligence ${done.knowledge ? 'on again' : 'unchanged'}, mode ${done.modeId ? 'put back' : 'unchanged'}`);
+    } catch (e: any) {
+      console.warn('[IPC] putting Pro switches back failed:', e?.message ?? e);
     }
   };
 
@@ -1327,19 +1453,18 @@ export function initializeIpcHandlers(appState: AppState): void {
       return { success: false, error: 'Premium features not available in this build.' };
     }
   });
-  safeHandle('license:check-premium', async () => {
-    try {
-      const { LicenseManager } = require('../premium/electron/services/LicenseManager');
-      return LicenseManager.getInstance().isPremium();
-    } catch {
-      return false;
-    }
-  });
+  safeHandle('license:check-premium', async () => licencePremiumForWindows());
 
+  // A Pro pack whose AI or speech-to-text is off Natively API reads as no Pro,
+  // with `packProPaused` naming which ('ai' | 'stt' | 'both') so Settings can
+  // say why. The licence itself stays stored (services/packs/packProRule.ts).
   safeHandle('license:get-details', async () => {
     try {
       const { LicenseManager } = require('../premium/electron/services/LicenseManager');
-      return LicenseManager.getInstance().getLicenseDetails();
+      const details = LicenseManager.getInstance().getLicenseDetails();
+      const { currentPackProBlock } = require('./services/proAccess') as typeof import('./services/proAccess');
+      const block = details?.isPremium ? currentPackProBlock() : null;
+      return block ? { ...details, isPremium: false, packProPaused: block } : details;
     } catch {
       return { isPremium: false };
     }
@@ -1367,7 +1492,26 @@ export function initializeIpcHandlers(appState: AppState): void {
     });
     return recheckLicence(lm, {
       stillAllowed: isProOrTrialActive,
-      onLost: () => {
+      onLost: async () => {
+        // The plan's licence went while a pack is in use: the plan may have
+        // ended, and the pack includes Pro (services/packs/nativelyPackFallback.ts
+        // moves it to the pack key). The pack takes Pro over FIRST; only if Pro
+        // is still gone after that is anything switched off. Switching off
+        // first left Profile Intelligence and the Pro mode off for good once
+        // the pack's Pro arrived (live test 2026-11-18).
+        try {
+          const { currentNativelyPackFallback } = require('./services/packs/nativelyPackFallback') as typeof import('./services/packs/nativelyPackFallback');
+          const fb = currentNativelyPackFallback();
+          if (fb?.state().inUse) {
+            packTakingOverPro = true;
+            try { await fb.check('licence lost'); } finally { packTakingOverPro = false; }
+            if (isProOrTrialActive()) {
+              console.log('[IPC] the plan\'s licence went; the pack in use took Pro over: Pro switches kept');
+              tell(licencePremiumForWindows());
+              return;
+            }
+          }
+        } catch { packTakingOverPro = false; /* not wired */ }
         try {
           const orchestrator = appState.getKnowledgeOrchestrator();
           if (orchestrator) {
@@ -1378,10 +1522,10 @@ export function initializeIpcHandlers(appState: AppState): void {
         clearActiveModeOnLicenseLoss();
         tell(false);
       },
-      onRestored: () => tell(true),
+      onRestored: () => tell(licencePremiumForWindows()),
     });
   };
-  safeHandle('license:check-premium-async', async () => runLicenceRecheck());
+  safeHandle('license:check-premium-async', async () => (await runLicenceRecheck()) && licencePremiumForWindows());
   // Whatever changes Pro (a check, an activation, a trial starting or running
   // out), what follows it outside the per-use checks follows within 30 s:
   // Profile Intelligence and a Pro mode switched off, the MCP server and local
@@ -1393,8 +1537,32 @@ export function initializeIpcHandlers(appState: AppState): void {
     try {
       void require('./services/outputs/outputsIpc').syncConnectorServersWithPro();
     } catch { /* connectors module absent */ }
+    // Some flips have no broadcast of their own: a Pro pack's Pro going off
+    // and on as the AI or speech-to-text provider moves (packs/packProRule.ts).
+    // Put back what the stand-down switched off, then tell the windows the
+    // licence as they should show it (they re-read the switches on it).
+    void (allowed ? restorePackStandDown() : Promise.resolve()).finally(() => {
+      const isPremium = licencePremiumForWindows();
+      BrowserWindow.getAllWindows().forEach((win) => {
+        if (!win.isDestroyed()) win.webContents.send('license-status-changed', { isPremium });
+      });
+    });
   });
+  try {
+    const { setLiveAiModelReader } = require('./services/proAccess') as typeof import('./services/proAccess');
+    setLiveAiModelReader(
+      () => appState.processingHelper?.getLLMHelper?.()?.getCurrentModelId?.(),
+      // Fast Response can answer on the user's own provider while the main model is Natively API.
+      () => appState.processingHelper?.getLLMHelper?.()?.fastResponseFamilyNow?.() ?? null,
+    );
+  } catch { /* the saved default model is read instead */ }
   proWatch.check();
+  checkProNow = () => {
+    // The pack clock bills the time up to this switch by the providers it ran
+    // on, not by the ones just picked (packs/PackMeetingClock.ts countsChanged).
+    try { require('./services/packs/packClockWiring').getPackMeetingClock().countsChanged(); } catch { /* no clock: nothing to bill */ }
+    proWatch.check();
+  };
   {
     proWatchTimer && clearInterval(proWatchTimer);
     proWatchTimer = setInterval(() => proWatch.check(), PRO_WATCH_EVERY_MS);
@@ -1724,6 +1892,10 @@ export function initializeIpcHandlers(appState: AppState): void {
       (pillWin && !pillWin.isDestroyed() && pillWin.webContents.id === event.sender.id) ||
       (toggleWin && !toggleWin.isDestroyed() && toggleWin.webContents.id === event.sender.id);
     if (!fromAux || !action?.type) return;
+    if (action.type === 'end-meeting' && guideStopLockedMs() > 0) {
+      console.log('[Guide] Stop from the pill held: the first meeting is still in its 30 s');
+      return;
+    }
     await routeOverlayUiAction(action, {
       endMeeting: () => appState.endMeeting(),
       forwardToOverlay: (a) => helper.forwardOverlayUiAction(a),
@@ -1798,6 +1970,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       const preview = await appState.getImagePreview(screenshotPath);
       // Make the upload JPEG now, while the user types, not when they send.
       prewarmPreparedJpeg(screenshotPath);
+      guideScreenshotTaken();
       return { path: screenshotPath, preview };
     } catch (error) {
       // console.error("Error taking screenshot:", error)
@@ -1835,6 +2008,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       const screenshotPath = await appState.takeSelectiveScreenshot();
       const preview = await appState.getImagePreview(screenshotPath);
       prewarmPreparedJpeg(screenshotPath);
+      guideScreenshotTaken();
       return { path: screenshotPath, preview };
     } catch (error) {
       // EC-04 fix: cast unknown error to Error before accessing .message
@@ -2189,6 +2363,9 @@ export function initializeIpcHandlers(appState: AppState): void {
         // bare user query, then inject the skill's instructions into context
         // right before streamChat so the model follows them for this turn only.
         let skillPromptBlock = '';
+        // The skill typed as /name this turn, so a "Use in every answer" copy of
+        // the same skill is not added a second time.
+        let activatedSkillId: string | null = null;
         const skillPrefixMatch = typeof message === 'string'
           ? message.match(/^[/$]([A-Za-z0-9_-]+)\s*(.*)$/s)
           : null;
@@ -2217,6 +2394,7 @@ export function initializeIpcHandlers(appState: AppState): void {
                 return null;  // sibling error paths return null; handler is typed `| null`
               }
               skillPromptBlock = SkillsManager.getInstance().buildPromptBlock(skill);
+              activatedSkillId = skill.id;
               const strippedQuery = skillPrefixMatch[2].trim();
               // Parsed here, APPLIED later (see the deferred assignment at the
               // original site). Mutating `message` now would change what every
@@ -2609,12 +2787,17 @@ export function initializeIpcHandlers(appState: AppState): void {
             // persona (the contract) and the composer (the note + the design on
             // the table), so the two cannot disagree. Same planner call the
             // coding verdict below uses.
+            // The planner's verdict for this typed turn, computed ONCE (it used
+            // to run five times inside this one call, from five copies that
+            // could drift). null when it threw; each reader keeps its fallback.
+            const v3Plan = (() => { try { return planAnswer({ question: v3Question, source: 'manual_input', speakerPerspective: 'user', activeMode: modeInfo ?? undefined }); } catch { return null; } })();
             const manualDiagramTurn: DiagramTurn | null = (() => {
               try {
+                if (!v3Plan) return null;
                 const im = appState.getIntelligenceManager?.();
                 const turn = resolveDiagramTurn({
                   question: v3Question,
-                  answerType: planAnswer({ question: v3Question, source: 'manual_input', speakerPerspective: 'user', activeMode: modeInfo ?? undefined }).answerType,
+                  answerType: v3Plan.answerType,
                   activeDesign: im?.getActiveDesign?.() ?? null,
                   pinnedModeId: modeInfo?.id ?? undefined,
                   hasVisualContext: (imagePaths?.length ?? 0) > 0,
@@ -2627,8 +2810,14 @@ export function initializeIpcHandlers(appState: AppState): void {
             })();
 
             const composed = await buildV3Prompt({
-              // "About you" (Cue Cards, Pro): every surface, every mode.
-              userBio: (require('./services/proAccess') as typeof import('./services/proAccess')).userBioForAnswers(),
+              // What the user told the app about themselves: About you (Cue
+              // Cards, Pro), the facts in the mode's Real-time prompt, and
+              // "Use in every answer" skills (a typed /name skill rides below).
+              ...(require('./services/answerPersonalContext') as typeof import('./services/answerPersonalContext')).personalContextForAnswers({
+                answerType: v3Plan?.answerType,
+                modeId: modeInfo?.id ?? null,
+                explicitSkillId: activatedSkillId,
+              }),
               surface: 'manual-chat',
               readingSurface: answerSurface === 'chat',
               diagramTurn: v3DiagramTurn(manualDiagramTurn),
@@ -2678,16 +2867,7 @@ export function initializeIpcHandlers(appState: AppState): void {
               // 06d88fba, left open here. planAnswer is pure and the real plan
               // is not built until much later in this handler, so this computes
               // the verdict directly from the message + active mode.
-              codingTask: (() => {
-                try {
-                  return isCodingAnswerType(planAnswer({
-                    question: v3Question,
-                    source: 'manual_input',
-                    speakerPerspective: 'user',
-                    activeMode: modeInfo ?? undefined,
-                  }).answerType);
-                } catch { return undefined; } // fall back to the bridge's own check
-              })(),
+              codingTask: v3Plan ? isCodingAnswerType(v3Plan.answerType) : undefined, // undefined: the bridge's own check
               // The mode's Real-time prompt, on V3's own channel (2026-09-20).
               // This call passed NO instruction channel at all: typed chat
               // relied on LLMHelper's mode-injection block, which is skipped
@@ -2697,8 +2877,8 @@ export function initializeIpcHandlers(appState: AppState): void {
               // of the system prompt (§19.2).
               realtimeInstruction: (() => {
                 try {
-                  const _plan = planAnswer({ question: v3Question, source: 'manual_input', speakerPerspective: 'user', activeMode: modeInfo ?? undefined });
-                  return ModesManager.getInstance().getActiveModePinnedInstructions?.(_plan.answerType, modeInfo?.id ?? undefined) || undefined;
+                  if (!v3Plan) return undefined;
+                  return ModesManager.getInstance().getActiveModePinnedInstructions?.(v3Plan.answerType, modeInfo?.id ?? undefined) || undefined;
                 } catch { return undefined; }
               })(),
               // The app's spoken-length default, on the LIVE surface only
@@ -2710,7 +2890,7 @@ export function initializeIpcHandlers(appState: AppState): void {
               defaultLengthDirective: answerSurface === 'live' ? (() => {
                 try {
                   const { renderLengthDirectiveForPlan } = require('./llm/AnswerPlanner') as typeof import('./llm/AnswerPlanner');
-                  return renderLengthDirectiveForPlan(planAnswer({ question: v3Question, source: 'manual_input', speakerPerspective: 'user', activeMode: modeInfo ?? undefined })) || undefined;
+                  return v3Plan ? renderLengthDirectiveForPlan(v3Plan, { pinnedModeId: modeInfo?.id ?? null }) || undefined : undefined;
                 } catch { return undefined; }
               })() : undefined,
               modeTemplateType: rawMode,
@@ -2840,7 +3020,7 @@ export function initializeIpcHandlers(appState: AppState): void {
                     // boundary skips non-coding screenshots.
                     if (!resolved.codingTask
                         && (imagePaths?.length ?? 0) > 0
-                        && (!v3Question.trim() || require('./llm/codingPromptSignals').isDeicticAsk(v3Question))) {
+                        && require('./llm/codingPromptSignals').isImageCodingAsk(v3Question)) {
                       // The screenshot grounds the problem; the words decide
                       // the shape ("explain this" is not "solve this").
                       return require('./llm/codingPromptSignals').screenPromotedCodingSignals(v3Question) as import('./llm/codingPromptSignals').CodingPromptSignals;
@@ -4457,7 +4637,17 @@ export function initializeIpcHandlers(appState: AppState): void {
                 contract: manualSourceContract,
                 evidence: evidenceRoute,
                 styleInstructions: formatAnswerPlanForPrompt(answerPlan, false),
-                maxAnswerWords: answerPlan.answerStyle === 'detailed' ? 180 : 90,
+                // The Answer length setting moves this on the live surface only,
+                // like the per-turn LENGTH line; the launcher keeps 90. A length
+                // in the mode's Real-time prompt wins on both: no target stated.
+                maxAnswerWords: (() => {
+                  try {
+                    const { registeredInstructionsSetLength } = require('./llm/userInstructionContract') as typeof import('./llm/userInstructionContract');
+                    if (registeredInstructionsSetLength(manualActiveMode?.id ?? null)) return null;
+                    const { profileAnswerWordCap, getRegisteredAnswerLength } = require('./llm/answerLength') as typeof import('./llm/answerLength');
+                    return profileAnswerWordCap(answerPlan.answerStyle, answerSurface === 'live' ? getRegisteredAnswerLength() : 'smart');
+                  } catch { return answerPlan.answerStyle === 'detailed' ? 180 : 90; }
+                })(),
               });
               const profileJitBlock = `${profileJitPrompt.systemPrompt}\n\n${profileJitPrompt.userPrompt}`;
               context = context ? `${profileJitBlock}\n\n${context}` : profileJitBlock;
@@ -5113,6 +5303,22 @@ export function initializeIpcHandlers(appState: AppState): void {
         // are the first thing the model sees in the user context block.
         if (skillPromptBlock) {
           context = context ? `${skillPromptBlock}\n\n${context}` : skillPromptBlock;
+        }
+        // What the user told the app about themselves, on the legacy transport
+        // too (2026-11-09): About you, the mode's Real-time prompt facts, and
+        // "Use in every answer" skills. A V3 turn whose provider fails falls
+        // back HERE, and live the skill then vanished (a "write in Spanish"
+        // skill on, a typed question came back in English). Same scoping as the
+        // V3 call: this turn's answer type and mode; the typed /name skill is
+        // excluded so it is not carried twice.
+        {
+          const personalBlock = (require('./services/answerPersonalContext') as typeof import('./services/answerPersonalContext')).personalContextBlockForAnswers({
+            answerType: answerPlan.answerType,
+            modeId: manualActiveMode?.id ?? null,
+            explicitSkillId: activatedSkillId,
+          });
+          // AFTER the rest: an over-budget context is trimmed from its head.
+          if (personalBlock) context = context ? `${context}\n\n${personalBlock}` : personalBlock;
         }
         const legacyWebSearchBlock = await webSearchBlockPromise;
         if (legacyWebSearchBlock) {
@@ -6224,8 +6430,16 @@ export function initializeIpcHandlers(appState: AppState): void {
               // deterministic trimmer was REMOVED because it cropped the conclusion off long
               // answers — so we NEVER trim here, we only measure the answer for telemetry (the
               // coarse length class + word count). The answer text is left exactly as produced.
-              const budget = applySpeakabilityBudget(fullResponse, answerPlan.answerType, answerPlan.answerStyle as any, message, isCodingChat);
-              piTelemetry.emit('pi_context_policy_applied', { answerType: answerPlan.answerType, via: 'speakability_measured', speakabilityClass: budget.speakability_class, markerCount: budget.spoken_word_count });
+              // Measured against the Answer length setting, the target this path's
+              // <answer_contract> stated (formatAnswerPlanForPrompt reads the same setting).
+              const measuredLength = (() => {
+                try {
+                  const { getRegisteredAnswerLength } = require('./llm/answerLength') as typeof import('./llm/answerLength');
+                  return getRegisteredAnswerLength();
+                } catch { return 'smart' as const; }
+              })();
+              const budget = applySpeakabilityBudget(fullResponse, answerPlan.answerType, answerPlan.answerStyle as any, message, isCodingChat, measuredLength);
+              piTelemetry.emit('pi_context_policy_applied', { answerType: answerPlan.answerType, via: 'speakability_measured', speakabilityClass: budget.speakability_class, markerCount: budget.spoken_word_count, answerLength: measuredLength });
               // Visible scaffold in a DEFAULT-style answer (user didn't ask for
               // structure): compress to the speakable form. detectAnswerStyle
               // already ran inside planAnswer (answerStyle on the plan).
@@ -7610,6 +7824,9 @@ export function initializeIpcHandlers(appState: AppState): void {
   // already-running process until the app is relaunched.
   safeHandle('restart-app', () => {
     console.log('[IPC] restart-app requested');
+    // app.exit skips before-quit: say it was a restart, or the next launch
+    // reads this run as one that vanished (app_run_ended).
+    try { require('./utils/lifecycleTracker').LifecycleTracker.getInstance().markRestart('restart-app'); } catch { /* best-effort */ }
     app.relaunch();
     app.exit(0);
   });
@@ -7778,8 +7995,11 @@ export function initializeIpcHandlers(appState: AppState): void {
     setOpenAtLogin(app, process.platform, openAtLogin, app.getPath('exe'));
     // The user chose: a pending fresh-install default (e.g. a DMG launch on
     // macOS) must not override it later. See utils/openAtLoginDefault.ts.
-    if (SettingsManager.getInstance().get('openAtLoginDefault') !== 'done') {
-      SettingsManager.getInstance().set('openAtLoginDefault', 'done');
+    // If that marker cannot be saved, say so: the default could otherwise turn
+    // the login item back on at a later launch, against the choice just made.
+    if (SettingsManager.getInstance().get('openAtLoginDefault') !== 'done'
+      && !SettingsManager.getInstance().set('openAtLoginDefault', 'done')) {
+      return { success: false, error: 'settings_store_degraded' };
     }
     return { success: true };
   });
@@ -7930,7 +8150,76 @@ export function initializeIpcHandlers(appState: AppState): void {
     return appState.getAutoAnswerEnabled();
   });
 
+  // Who may run Auto Answer, and whether this user's meetings are shared
+  // (autoAnswerAccess.ts). basis 'pro' | 'sharing' | 'none'.
+  safeHandle('auto-answer:get-access', async () => {
+    const SettingsManager = require('./services/SettingsManager').SettingsManager;
+    const consent = SettingsManager.getInstance().get('autoAnswerTrainingConsent') ?? null;
+    const access = appState.getAutoAnswerAccess();
+    return { available: appState.isAutoAnswerAvailable(), allowed: access.allowed, basis: access.basis, uploads: access.uploads, consent, enabled: appState.getAutoAnswerEnabled() };
+  });
+
+  // Agree to share (free users: unlocks Auto Answer; Pro: the opt-in), or withdraw.
+  // Withdrawing for a free user leaves the toggle as it is but Auto Answer stops
+  // (isAutoAnswerActive), and nothing more is uploaded.
+  safeHandle('auto-answer:set-training-consent', async (_, granted: boolean) => {
+    const ok = appState.setAutoAnswerTrainingConsent(Boolean(granted));
+    return ok ? { success: true } : { success: false, error: 'Settings store is unavailable; the change was not saved.' };
+  });
+
+  // The Auto Answer model: a paid, private download for API keys and Pro
+  // (premium/electron/autoAnswer/decider/deciderModelInstaller.ts), and its
+  // before/after judge-call card (deciderSavings.ts, numbers only).
+  // judgeViaNatively: Natively API is the selected AI (or the judge's only
+  // route), so the card's estimate says "Natively API" instead of a model
+  // name (Evin 2026-11-14), even when another key would judge first.
+  const autoAnswerModelState = () => {
+    const llm = appState.processingHelper?.getLLMHelper?.();
+    return {
+      install: appState.deciderInstaller().status(),
+      savings: appState.deciderSavings().summary(),
+      judgeViaNatively: llm?.getCurrentModelId?.() === 'natively' || llm?.judgeRunsOnNatively?.() === true,
+    };
+  };
+  safeHandle('auto-answer-model:get-status', async () => autoAnswerModelState());
+  safeHandle('auto-answer-model:install', async () => {
+    const send = (install: unknown) => {
+      for (const win of BrowserWindow.getAllWindows()) {
+        if (!win.isDestroyed()) win.webContents.send('auto-answer-model:progress', install);
+      }
+    };
+    const result = await appState.deciderInstaller().install(send);
+    if (result.state === 'installed') {
+      appState.deciderSavings().markInstalled();
+      appState.resetAutoAnswerDecider();
+    }
+    return autoAnswerModelState();
+  });
+  safeHandle('auto-answer-model:remove', async () => {
+    // Stop the worker first: Windows will not delete a graph a process still has open.
+    appState.resetAutoAnswerDecider();
+    const installer = appState.deciderInstaller();
+    installer.remove();
+    if (installer.installedDir()) {
+      await new Promise((r) => setTimeout(r, 3500)); // the utility process's stop grace (deciderUtilityHost.ts)
+      installer.remove();
+    }
+    if (!installer.installedDir()) appState.deciderSavings().markRemoved();
+    return autoAnswerModelState();
+  });
+
   safeHandle('set-auto-answer-enabled', async (_, enabled: boolean) => {
+    // Auto Answer is Pro or trial, or free with training-data sharing
+    // (premium/electron/autoAnswer/autoAnswerAccess.ts). Switching off is always free.
+    if (enabled) {
+      const access = appState.getAutoAnswerAccess();
+      if (!access.allowed && access.error === 'auto_answer_unavailable') {
+        return { success: false, error: access.error, message: 'Auto Answer is not part of this build.' };
+      }
+      if (!access.allowed) {
+        return { success: false, error: access.error, message: 'Auto Answer is part of Natively Pro. You can also use it for free by sharing the transcripts of meetings where it runs.' };
+      }
+    }
     const persisted = appState.setAutoAnswerEnabled(Boolean(enabled));
     return persisted
       ? { success: true }
@@ -8605,13 +8894,39 @@ export function initializeIpcHandlers(appState: AppState): void {
       console.warn('[direct-assist] live session transcript unavailable, proceeding without it:', (error as Error)?.message);
     }
 
+    // What the user told the app about themselves (2026-11-09), which every
+    // other answer surface carries: "Use in every answer" skills ride Direct
+    // Assist's own skill slot (merged after a /name skill, never duplicating
+    // it), and About you + the mode's Real-time prompt facts ride its
+    // user-context block. No answer type: Direct Assist never consults the
+    // answer planner (DirectAssistIpcBridge pins that), so the mode's notes come
+    // without their per-type gate — the sensitive ones (pricing floors, salary)
+    // stay out, as for any turn without a type.
+    let directSkill: DirectAssistRequestInput['skill'] = resolvedSkill.skill ?? null;
+    let directManualContext = request.manualContext;
+    try {
+      const personal = require('./services/answerPersonalContext') as typeof import('./services/answerPersonalContext');
+      const ctx = personal.personalContextForAnswers({ explicitSkillId: directSkill?.id ?? null });
+      if (ctx.standingSkills) {
+        directSkill = Object.freeze({
+          id: directSkill?.id ?? 'always-on',
+          name: directSkill?.name ?? 'Use in every answer',
+          instructions: directSkill ? `${directSkill.instructions}\n\n${ctx.standingSkills}` : ctx.standingSkills,
+        });
+      }
+      const facts = personal.renderPersonalContextBlock(ctx, { includeSkills: false });
+      if (facts) directManualContext = directManualContext ? `${directManualContext}\n\n${facts}` : facts;
+    } catch (error) {
+      console.warn('[direct-assist] personal context unavailable, proceeding without it:', (error as Error)?.message);
+    }
+
     const directRequest: DirectAssistRequestInput = Object.freeze({
       requestId: request.requestId,
       source: request.source,
       selection,
       currentRequest: resolvedSkill.currentRequest,
-      skill: resolvedSkill.skill ?? null,
-      manualContext: request.manualContext,
+      skill: directSkill,
+      manualContext: directManualContext,
       referenceFiles,
       pageContext: request.pageContext,
       history: request.history,
@@ -8884,6 +9199,24 @@ export function initializeIpcHandlers(appState: AppState): void {
     return { success: true };
   });
 
+  // Settings › Overlay › Answer length (llm/answerLength.ts). get answers with
+  // what answers use now: Smart without Pro, whatever is stored. Shorter and
+  // Longer are Pro; going back to Smart is turning it off, which stays free.
+  safeHandle('answer-length:get', async () => {
+    const { effectiveAnswerLength } = require('./llm/answerLength') as typeof import('./llm/answerLength');
+    return { value: effectiveAnswerLength(SettingsManager.getInstance().get('answerLength'), isProOrTrialActive()) };
+  });
+
+  safeHandle('answer-length:set', async (_, value: unknown) => {
+    const { isAnswerLength } = require('./llm/answerLength') as typeof import('./llm/answerLength');
+    if (!isAnswerLength(value)) return { success: false, error: 'invalid_value' };
+    if (value !== 'smart' && !isProOrTrialActive()) return proRefusal();
+    if (!SettingsManager.getInstance().set('answerLength', value)) {
+      return { success: false, error: 'settings_store_degraded' };
+    }
+    return { success: true };
+  });
+
   // Settings › Overlay › Screenshot screen (electron/screenshotDisplay.ts).
   safeHandle('get-screenshot-display', async () => {
     const { listScreenshotDisplays, parseScreenshotDisplayPreference } = require('./screenshotDisplay');
@@ -9112,11 +9445,13 @@ export function initializeIpcHandlers(appState: AppState): void {
       // banner can render Cloud-key-specific copy (different from the generic "Can't connect").
       // isAuthFailed() reads the cached lastAuthFailedAt timestamp.
       if (hm.isAuthFailed?.()) {
+        const status = { state: 'auth-failed', reason: 'Cloud key rejected (401/403) — check your Hindsight Cloud account key', at: Date.now() };
+        hm.noteStatus(status);
         try {
           const { BrowserWindow } = require('electron') as typeof import('electron');
           BrowserWindow.getAllWindows().forEach((win) => {
             if (!win.isDestroyed()) {
-              win.webContents.send('hindsight-status', { state: 'auth-failed', reason: 'Cloud key rejected (401/403) — check your Hindsight Cloud account key', at: Date.now() });
+              win.webContents.send('hindsight-status', status);
             }
           });
         } catch { /* headless */ }
@@ -9125,6 +9460,18 @@ export function initializeIpcHandlers(appState: AppState): void {
       return { healthy };
     } catch (e: any) {
       return { healthy: false, error: e?.message };
+    }
+  });
+
+  // The last Hindsight lifecycle status, for a window that subscribes after it
+  // was broadcast (the launcher's notice mounts seconds after boot, after a
+  // spawn failure at startup). null before the first.
+  safeHandle('hindsight:get-status', async () => {
+    try {
+      const { HindsightManager } = require('./services/HindsightManager') as typeof import('./services/HindsightManager');
+      return HindsightManager.getInstance().getLastStatus();
+    } catch {
+      return null;
     }
   });
 
@@ -9177,11 +9524,13 @@ export function initializeIpcHandlers(appState: AppState): void {
       // If we spawned an app-managed server, kill it. Cloud / user-managed servers stay up.
       try { HindsightManager.getInstance().stopSync(); } catch { /* nothing to stop */ }
       // Broadcast so any open banner clears with the "you're in control" state.
+      const status = { state: 'ready', reason: 'disabled by user', at: Date.now() };
+      try { HindsightManager.getInstance().noteStatus(status); } catch { /* not loaded */ }
       try {
         const { BrowserWindow } = require('electron') as typeof import('electron');
         BrowserWindow.getAllWindows().forEach((win) => {
           if (!win.isDestroyed()) {
-            win.webContents.send('hindsight-status', { state: 'ready', reason: 'disabled by user', at: Date.now() });
+            win.webContents.send('hindsight-status', status);
           }
         });
       } catch { /* headless */ }
@@ -9243,6 +9592,78 @@ export function initializeIpcHandlers(appState: AppState): void {
     }
     return { success: false, error: 'invalid_key' };
   });
+
+  // The permissions card's closes while a permission is still missing
+  // (src/lib/permissionsCardPolicy.mjs). Main-process owned, like permsShown:
+  // it must survive restarts and updates, whatever origin the renderer has.
+  safeHandle('permissions-card:get', async () => {
+    return normalizePermissionsCardRecord(SettingsManager.getInstance().get('permissionsCard'));
+  });
+
+  safeHandle('permissions-card:record', async (_, event: unknown) => {
+    if (event !== 'dismissed' && event !== 'granted') return { success: false, error: 'invalid_event' };
+    const sm = SettingsManager.getInstance();
+    const record = applyPermissionsCardEvent(sm.get('permissionsCard'), event, Date.now());
+    if (!sm.set('permissionsCard', record)) return { success: false, error: 'settings_store_degraded' };
+    return { success: true, record };
+  });
+
+  // First-run guide (docs/superpowers/specs/2026-11-10-first-run-guide-design.md).
+  // Main owns the state so the launcher, overlay, notes window and Settings stay
+  // on one step; each window reports what it saw and the reducer decides. An
+  // event that changes nothing (two windows seeing the same meeting stop) is
+  // neither saved nor broadcast. Main supplies what a window cannot know
+  // (services/firstRunGuideStore.ts): a running trial's placeholder Natively
+  // key is not a purchase, and whether and where a meeting runs comes from AppState.
+  configureGuideStore({
+    meetingActive: () => appState.getIsMeetingActive(),
+    factsProvider: () => {
+      const { CredentialsManager } = require('./services/CredentialsManager');
+      const cm = CredentialsManager.getInstance();
+      return guideFactsFromSources({
+        nativelyKey: cm.getNativelyApiKey(),
+        trialSentinel: TRIAL_SENTINEL_KEY,
+        licensed: isLicensed(),
+        hasOwnAiKey: hasOwnAiKey(cm.getAllCredentials(), { codexReady: codexRouteReady() }),
+        // First users only: someone with a meeting of their own is not one.
+        hasMeetings: DatabaseManager.getInstance().hasOwnMeeting(),
+      });
+    },
+    meetingSurface: () => appState.getMeetingSurface(),
+    // Two meetings (Evin, 2026-11-15): the first is the overlay's, the second
+    // the notepad's, picked by the user in Settings › Overlay at step 7. The
+    // guide sets the overlay as it starts and, when it ends, puts back what
+    // the user had before ("Put the overlay back": the overlay, for a new user).
+    onGuideStart: () => {
+      const sm = SettingsManager.getInstance();
+      if (sm.get('guideSurfaceBefore') == null) sm.set('guideSurfaceBefore', normalizeMeetingSurface(sm.get('meetingSurface')));
+      sm.set('meetingSurface', 'overlay');
+    },
+    onGuideEnd: () => {
+      const sm = SettingsManager.getInstance();
+      sm.set('meetingSurface', normalizeMeetingSurface(sm.get('guideSurfaceBefore') ?? 'overlay'));
+      sm.set('guideSurfaceBefore', null);
+    },
+    // Step 7 with the notepad already chosen: nothing to switch, go on.
+    onEnterStep: (step) => {
+      if (step === 'surface' && normalizeMeetingSurface(SettingsManager.getInstance().get('meetingSurface')) === 'notepad') guideSurfaceSet('notepad');
+    },
+    // Step 2: the demo film plays in the user's browser (Evin, 2026-11-15), so
+    // there is a voice asking questions for the meeting to hear and answer. The
+    // browser, not the app: the app's own sound is left out of system-audio
+    // capture on macOS (sck.rs excludes the current process), and a visible,
+    // user-watched view is the only kind YouTube counts. shell.openExternal is
+    // the same on macOS and Windows; on macOS the browser stays behind
+    // (demoFilmOpenOptions). A browser that blocks autoplay: the overlay asks
+    // the user to press play (OverlayGuide, DEMO_FILM_QUIET_MS).
+    onFirstMeetingStarted: () => {
+      shell.openExternal(DEMO_VIDEO_URL, demoFilmOpenOptions(process.platform)).catch((e) => console.warn('[Guide] demo film did not open:', e?.message));
+    },
+  });
+  safeHandle('guide:get', async () => getGuideState());
+  // Validated against GUIDE_EVENT_TYPES; then reduced, saved and broadcast
+  // ('guide:changed') to every window.
+  safeHandle('guide:dispatch', async (_, event: unknown) => dispatchGuideFromWindow(event));
 
   // First-launch shortcut tour: route the shortcuts it teaches to the calling
   // renderer as practice presses (AppState.setShortcutTour). Bound to the
@@ -12409,6 +12830,58 @@ export function initializeIpcHandlers(appState: AppState): void {
   const _plansCache = new Map<string, { data: any; ts: number }>();
   const PLANS_CACHE_TTL_MS = 15 * 60_000;
 
+  /**
+   * One app, two Natively keys (2026-11-17). A pack key pasted while a live
+   * monthly/yearly key is saved is HELD beside it, not saved over it; a
+   * monthly/yearly key pasted over a live pack saves normally and holds the
+   * pack. The held key takes over when the plan is used up
+   * (services/packs/nativelyPackFallback.ts). Removing the saved key while a
+   * pack is held saves the pack key in its place.
+   *
+   * Answers `done` when the save is finished here (the key was held), else the
+   * key the normal save below should store.
+   */
+  const routePastedNativelyKey = async (cm: any, apiKey: string): Promise<{ done?: { success: boolean; error?: string; storedAs?: 'pack' }; apiKey: string }> => {
+    const pastedKey = typeof apiKey === 'string' ? apiKey.trim() : '';
+    if (pastedKey) {
+      const slot = await packFallback.slotForSave(pastedKey);
+      if (slot === 'same') return { done: { success: true, storedAs: 'pack' }, apiKey };
+      if (slot === 'pack_taken') {
+        // One pack key per customer: every pack lands on it (Evin, 2026-11-17).
+        console.log('[IPC] set-natively-api-key: refused a second pack key while a live one is here');
+        const { PACK_TAKEN_MESSAGE } = require('./services/packs/nativelyPackFallback') as typeof import('./services/packs/nativelyPackFallback');
+        return { done: { success: false, error: PACK_TAKEN_MESSAGE }, apiKey };
+      }
+      if (slot === 'pack') {
+        const wasInUse = cm.isNativelyPackInUse();
+        if (!cm.setNativelyPackApiKey(pastedKey)) return { done: { success: false, error: 'credentials_unavailable' }, apiKey };
+        if (wasInUse) await resyncNativelyKeyInUse('held pack key replaced');
+        _usageCache.clear();
+        broadcastCredentialsChanged();
+        // The pack is used first: it goes in use now.
+        void packFallback.check('pack key held');
+        BrowserWindow.getAllWindows().forEach((win) => {
+          if (!win.isDestroyed()) win.webContents.send('natively-pack-fallback-changed', packFallback.state());
+        });
+        funnelTelemetry.keyEntered('api_key', 'ok');
+        console.log('[IPC] set-natively-api-key: pack key held beside the saved plan key');
+        return { done: { success: true, storedAs: 'pack' }, apiKey };
+      }
+      if (slot === 'swap') {
+        cm.setNativelyPackApiKey(cm.getMainNativelyApiKey() ?? null);
+        console.log('[IPC] set-natively-api-key: plan key saved; the live pack key it replaces is held beside it');
+      }
+      return { apiKey };
+    }
+    const held: string | undefined = cm.getNativelyPackApiKey();
+    if (held) {
+      cm.setNativelyPackApiKey(null);
+      console.log('[IPC] set-natively-api-key: saved key removed — the held pack key becomes the saved key');
+      return { apiKey: held };
+    }
+    return { apiKey };
+  };
+
   safeHandle('set-natively-api-key', async (_, apiKey: string) => {
     // Set when the server REFUSES the key, so the handler can report the real
     // reason instead of the unconditional { success: true } it used to return
@@ -12421,6 +12894,10 @@ export function initializeIpcHandlers(appState: AppState): void {
     try {
       const { CredentialsManager } = require('./services/CredentialsManager');
       const cm = CredentialsManager.getInstance();
+
+      const routed = await routePastedNativelyKey(cm, apiKey); // a pack key may be held
+      if (routed.done) return routed.done;
+      apiKey = routed.apiKey;
       const prevSttProvider = cm.getSttProvider();
       // Captured BEFORE the write, because the write overwrites the trial
       // sentinel. A live trial running underneath this save is a state both
@@ -12434,9 +12911,11 @@ export function initializeIpcHandlers(appState: AppState): void {
         !trialTimeIsUp();
       cm.setNativelyApiKey(apiKey);
 
-      // Update LLMHelper immediately (same pattern as other provider keys)
+      // Update LLMHelper immediately (same pattern as other provider keys).
+      // The key IN USE, not the one just saved: a held pack in use stays in use
+      // when a plan key is saved beside it (services/packs/nativelyPackFallback.ts).
       const llmHelper = appState.processingHelper.getLLMHelper();
-      llmHelper.setNativelyKey(apiKey || null);
+      llmHelper.setNativelyKey(cm.getNativelyApiKey() || null);
 
       // Sync the model into LLMHelper and notify the UI whenever the effective default changed
       const defaultModel = cm.getDefaultModel();
@@ -12486,11 +12965,14 @@ export function initializeIpcHandlers(appState: AppState): void {
           const result = await LicenseManager.getInstance().activateWithApiKey(apiKey);
           if (result.success) {
             console.log('[IPC] set-natively-api-key: Pro auto-activated via API plan.');
-            // Notify all windows so the license UI refreshes immediately
+            // Notify all windows so the license UI refreshes immediately. A Pro
+            // pack whose AI or speech-to-text is off Natively API shows no Pro.
+            const isPremium = licencePremiumForWindows();
             BrowserWindow.getAllWindows().forEach((win) => {
               if (!win.isDestroyed())
-                win.webContents.send('license-status-changed', { isPremium: true });
+                win.webContents.send('license-status-changed', { isPremium });
             });
+            checkProNow();
           } else if (result.skipped && !result.error) {
             // Benign skip: the stored perpetual license is verified and already
             // granting Pro, so there is nothing to tell the user.
@@ -12635,9 +13117,18 @@ export function initializeIpcHandlers(appState: AppState): void {
         });
       }
 
+      // Last, once the stored key (and trial token) are final for this save:
+      // a refused key may have restored the trial above, a purchase cleared it.
+      refreshNativelyEmbeddings('Natively key saved');
+
       // A cleared key is not a key entered; the trial sentinel never comes
       // through this handler (trial:start writes it directly).
       if (apiKey) funnelTelemetry.keyEntered('api_key', keyRejection ? 'invalid' : 'ok');
+
+      // A plan key saved beside a held pack (the swap, or a new plan key): the
+      // pack is used first, so it goes (back) in use. Last, so the Pro set-up
+      // above for the plan's key is already done.
+      if (apiKey && !keyRejection && cm.getNativelyPackApiKey()) void packFallback.check('plan key saved beside a pack');
 
       return keyRejection
         ? { success: false, error: keyRejection.error }
@@ -12665,6 +13156,21 @@ export function initializeIpcHandlers(appState: AppState): void {
   //
   // NO KEY REQUIRED, deliberately: a visitor deciding which plan to buy has no
   // key yet, and that is exactly who the table is for.
+  // The opt-in diagnostic report (2026-11-18, #759). Both run only when the
+  // person asks: the preview shows exactly what the send would carry.
+  safeHandle('diagnostic-report:preview', async () => {
+    const { previewCurrentDiagnosticReport } = require('./services/diagnosticReportWiring') as typeof import('./services/diagnosticReportWiring');
+    return previewCurrentDiagnosticReport();
+  });
+  safeHandle('connect-diagnosis:last', async () => {
+    const { lastConnectionNotice } = require('./services/diagnosticReportWiring') as typeof import('./services/diagnosticReportWiring');
+    return lastConnectionNotice();
+  });
+  safeHandle('diagnostic-report:send', async () => {
+    const { sendCurrentDiagnosticReport } = require('./services/diagnosticReportWiring') as typeof import('./services/diagnosticReportWiring');
+    return sendCurrentDiagnosticReport();
+  });
+
   safeHandle('get-natively-plans', async () => {
     try {
       const cached = _plansCache.get('plans');
@@ -12692,12 +13198,41 @@ export function initializeIpcHandlers(appState: AppState): void {
     }
   });
 
-  safeHandle('get-natively-usage', async (_event, opts?: { force?: boolean }) => {
+  // "Didn't get your key? Email it again" (Plans & Billing). The server sends
+  // the key to the address on file and never returns it, answering the same
+  // whether or not a key exists; it allows 5 tries per network per hour. No key
+  // required: the person asking is exactly the one who has no key yet.
+  safeHandle('resend-natively-key', async (_event, email: unknown) => {
+    const address = typeof email === 'string' ? email.trim() : '';
+    if (!address || address.length > 254 || !address.includes('@')) return { ok: false, error: 'invalid_email' };
+    try {
+      const res = await fetch(`${NATIVELY_API_BASE}/keys/resend`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ email: address }),
+        signal: AbortSignal.timeout(10000),
+      });
+      const body = (await res.json().catch(() => ({}))) as any;
+      if (res.status === 429) return { ok: false, error: 'rate_limited' };
+      if (!res.ok) return { ok: false, error: body?.error || 'request_failed' };
+      return { ok: true, message: typeof body?.message === 'string' ? body.message : undefined };
+    } catch (error: any) {
+      return { ok: false, error: 'network_error' };
+    }
+  });
+
+  safeHandle('get-natively-usage', async (_event, opts?: { force?: boolean; which?: 'active' | 'main' | 'pack' }) => {
     // Hoisted out of try so the catch block's stale-cache lookup can reach it.
     let key: string | undefined;
     try {
       const { CredentialsManager } = require('./services/CredentialsManager');
-      key = CredentialsManager.getInstance().getNativelyApiKey();
+      const cmUsage = CredentialsManager.getInstance();
+      // 'active' (default): the key in use, which is what the quota banners
+      // describe. Plans & Billing asks for the saved key ('main') and for the
+      // pack key held beside it ('pack') separately.
+      key = opts?.which === 'main' ? cmUsage.getMainNativelyApiKey()
+        : opts?.which === 'pack' ? cmUsage.getNativelyPackApiKey()
+        : cmUsage.getNativelyApiKey();
       if (!key) return { ok: false, error: 'no_key' };
 
       // Return cached value if it's still fresh — skipped when the caller
@@ -12717,6 +13252,8 @@ export function initializeIpcHandlers(appState: AppState): void {
       // to Standard): ask the licence server now rather than at the next 6-hour
       // check. A reason to ask only; the licence check decides.
       const askLicenceIf = (answer: { ok: boolean; plan?: unknown; error?: unknown }) => {
+        // The held pack key's own numbers say nothing about the key in use.
+        if (opts?.which === 'pack') return;
         try {
           const { usageSuggestsProLost } = require('./services/licenceRecheck') as typeof import('./services/licenceRecheck');
           if (usageSuggestsProLost(answer)) triggerLicenceRecheck('usage');
@@ -12744,6 +13281,16 @@ export function initializeIpcHandlers(appState: AppState): void {
       const data = (await res.json()) as any;
       askLicenceIf({ ok: true, plan: data?.plan });
       const result = { ok: true, ...data };
+      // A held pack that was over is live again: a new pack landed on its key.
+      // It is used first, so look now rather than at the slow watch.
+      if (opts?.which === 'pack' && data?.pack && !data.pack.ended) {
+        try {
+          const { currentNativelyPackFallback } = require('./services/packs/nativelyPackFallback') as typeof import('./services/packs/nativelyPackFallback');
+          const fb = currentNativelyPackFallback();
+          const st = fb?.state();
+          if (fb && st?.held && !st.inUse && !st.stoppedEarly) void fb.check('held pack live again');
+        } catch { /* not wired */ }
+      }
 
       // Cache the successful response
       _usageCache.set(key, { data: result, ts: Date.now() });
@@ -12751,7 +13298,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       // The plan is now known. If it includes Pro and Pro is off on this device,
       // fix that here — this is the moment the user is looking at "Ultra" with no
       // Pro features. Fire-and-forget; passes the plan so no second request is made.
-      if (typeof data?.plan === 'string') {
+      if (typeof data?.plan === 'string' && opts?.which !== 'pack') {
         try {
           const { getProEntitlementReconciler } = require('./services/proEntitlementWiring');
           void getProEntitlementReconciler().run('usage-ok', { plan: data.plan });
@@ -12768,9 +13315,233 @@ export function initializeIpcHandlers(appState: AppState): void {
     }
   });
 
+  // The signed upgrade token for the saved key (natively-api /v1/upgrade-link,
+  // 2026-11-17). The Plans tab adds it to a checkout link so the purchase lands
+  // on THIS key even when the customer pays with another email. Any failure
+  // answers ok:false and the link opens untouched (the server then matches by
+  // email). The key itself never leaves the main process.
+  safeHandle('get-natively-upgrade-link', async (_event, family?: unknown) => {
+    try {
+      const { CredentialsManager } = require('./services/CredentialsManager');
+      const cm = CredentialsManager.getInstance();
+      // A plan purchase carries the plan's (saved) key; a pack purchase carries
+      // the held pack key, so the new pack stacks on the customer's ONE pack key
+      // even when they pay with another email.
+      const key: string | undefined = (family === 'pack' ? cm.getNativelyPackApiKey() : undefined) ?? cm.getMainNativelyApiKey();
+      if (!key) return { ok: false, error: 'no_key' };
+      const res = await fetch(`${NATIVELY_API_BASE}/v1/upgrade-link`, {
+        headers: { 'x-natively-key': key },
+        signal: AbortSignal.timeout(2500),
+      });
+      const body = (await res.json().catch(() => ({}))) as any;
+      if (!res.ok || body?.ok !== true) return { ok: false, error: body?.error || `http_${res.status}` };
+      return {
+        ok: true,
+        token: typeof body.token === 'string' ? body.token : null,
+        email: typeof body.email === 'string' ? body.email : null,
+      };
+    } catch (error: any) {
+      return { ok: false, error: error?.message || 'network_error' };
+    }
+  });
+
+  // A live yearly plan moving up a yearly tier on its own Dodo subscription
+  // (natively-api POST /v1/yearly-upgrade, 2026-11-17). Without expectedAmount it
+  // only asks what would be charged; with it, Dodo charges that amount (the
+  // server refuses if the amount moved). The saved plan key, never a held pack.
+  safeHandle('natively-yearly-upgrade', async (_e, plan: unknown, expectedAmount?: unknown) => {
+    try {
+      if (typeof plan !== 'string' || !/^(standard|pro|max|ultra)$/.test(plan)) return { ok: false, error: 'bad_plan' };
+      const { CredentialsManager } = require('./services/CredentialsManager');
+      const key: string | undefined = CredentialsManager.getInstance().getMainNativelyApiKey();
+      if (!key) return { ok: false, error: 'no_key' };
+      const body: Record<string, unknown> = { plan };
+      if (typeof expectedAmount === 'number' && Number.isFinite(expectedAmount)) body.expected_amount = expectedAmount;
+      const res = await fetch(`${NATIVELY_API_BASE}/v1/yearly-upgrade`, {
+        method: 'POST',
+        headers: { 'x-natively-key': key, 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(20_000),
+      });
+      const out = (await res.json().catch(() => ({}))) as any;
+      const preview = out?.preview && Number.isFinite(out.preview.amount) && typeof out.preview.currency === 'string'
+        ? { plan: String(out.preview.plan), amount: Number(out.preview.amount), currency: out.preview.currency }
+        : null;
+      if (!res.ok || out?.ok !== true) return { ok: false, error: out?.error || `http_${res.status}`, preview };
+      if (out.changed) _usageCache.clear();
+      return { ok: true, changed: out.changed === true, preview };
+    } catch (error: any) {
+      return { ok: false, error: error?.message || 'network_error' };
+    }
+  });
+
   // Allow other handlers to force-invalidate the usage cache (e.g. after key change)
   safeHandle('invalidate-natively-usage-cache', () => {
     _usageCache.clear();
+    return { ok: true };
+  });
+
+  // ── One app, two Natively keys (2026-11-17) ──────────────────────────────────
+  // A pack key held beside a monthly/yearly key takes over while the plan's
+  // allowance is used up (services/packs/nativelyPackFallback.ts).
+  const fetchKeyUsage = async (key: string): Promise<import('./services/packs/nativelyPackFallback').KeyUsage> => {
+    try {
+      const res = await fetch(`${NATIVELY_API_BASE}/v1/usage`, {
+        headers: { 'x-natively-key': key },
+        signal: AbortSignal.timeout(8000),
+      });
+      const body = (await res.json().catch(() => ({}))) as any;
+      if (!res.ok) return { ok: false, error: body?.error || 'request_failed', status: res.status, ...(body?.pack ? { pack: body.pack } : {}) };
+      return { ok: true, ...body };
+    } catch (e: any) {
+      return { ok: false, error: 'network_error' };
+    }
+  };
+
+  /** Re-point everything that holds a Natively key at the key in use now. */
+  const resyncNativelyKeyInUse = async (reason: string): Promise<void> => {
+    const { CredentialsManager } = require('./services/CredentialsManager');
+    const cm = CredentialsManager.getInstance();
+    const active: string | undefined = cm.getNativelyApiKey();
+    _usageCache.clear();
+    try { appState.processingHelper?.getLLMHelper?.()?.setNativelyKey(active || null); } catch (e: any) {
+      console.warn('[PackFallback] LLM key update failed:', e?.message);
+    }
+    syncNativelyModelRuntime(); // retrieval, the model chip, the settings panels
+    // The voice pipeline holds its key: rebuild it (mid-meeting too) on the key in use.
+    if (cm.getSttProvider() === 'natively') {
+      try { await appState.reconfigureSttProvider(); } catch (e: any) { console.warn('[PackFallback] voice rebuild failed:', e?.message); }
+    }
+    try {
+      const { packMeetingClockIfStarted } = require('./services/packs/packClockWiring');
+      packMeetingClockIfStarted()?.keyChanged();
+    } catch { /* clock not running */ }
+    // Pro follows the key in use, and moves only when it has to (review
+    // 2026-11-17). A pack includes Natively Pro on Natively API.
+    //   - Pack in use: Pro is activated with the pack key only when Pro is not
+    //     on already (a Standard plan) or the plan itself has ended. A Pro, Max
+    //     or Ultra plan's licence stays on the plan's key, so the pack ending
+    //     never touches it.
+    //   - Plan key back: Pro is activated with it. A definite "no" (the plan has
+    //     no Pro, or its key is refused) re-checks the stored licence, which
+    //     removes a pack's Pro once the pack is over. No answer (offline, 5xx)
+    //     changes nothing: the licence re-check schedule settles it later. A
+    //     lifetime or Dodo licence is never touched (skipped).
+    try {
+      const { LicenseManager } = require('../premium/electron/services/LicenseManager');
+      const lm = LicenseManager.getInstance();
+      const onPack = !!active && active === cm.getNativelyPackApiKey();
+      let changed = false;
+      if (onPack) {
+        if (!licencePremiumForWindows() || reason.startsWith('plan ended')) {
+          changed = !!(await lm.activateWithApiKey(active))?.success;
+        }
+      } else {
+        const result = active && active !== TRIAL_SENTINEL_KEY ? await lm.activateWithApiKey(active) : null;
+        changed = !!result?.success;
+        const definiteNo = !result
+          || (!result.success && !result.skipped && (result.keyRejected || /does not include Natively Pro/i.test(result.error || '')));
+        if (definiteNo) {
+          const { recheckProNow } = require('./services/packs/packClockWiring') as typeof import('./services/packs/packClockWiring');
+          await recheckProNow();
+          // The pack clock's teardown is main.ts's, registered at the first
+          // meeting: stand the Pro-only features down here as well, so a pack
+          // that ends before any meeting leaves nothing switched on.
+          standDownIfNoPro('pack over, plan key back');
+          changed = true;
+        }
+      }
+      if (changed) {
+        const isPremium = licencePremiumForWindows();
+        BrowserWindow.getAllWindows().forEach((win) => {
+          if (!win.isDestroyed()) win.webContents.send('license-status-changed', { isPremium });
+        });
+      }
+    } catch { /* open-source build: no Pro */ }
+    console.log(`[PackFallback] key in use re-synced (${reason})`);
+  };
+
+  const { createNativelyPackFallback, setNativelyPackFallback } =
+    require('./services/packs/nativelyPackFallback') as typeof import('./services/packs/nativelyPackFallback');
+  const packFallback = createNativelyPackFallback({
+    getMainKey: () => require('./services/CredentialsManager').CredentialsManager.getInstance().getMainNativelyApiKey(),
+    getPackKey: () => require('./services/CredentialsManager').CredentialsManager.getInstance().getNativelyPackApiKey(),
+    getInUseUntil: () => require('./services/CredentialsManager').CredentialsManager.getInstance().getNativelyPackInUseUntil(),
+    setInUseUntil: (iso) => { require('./services/CredentialsManager').CredentialsManager.getInstance().setNativelyPackInUseUntil(iso); },
+    fetchUsage: fetchKeyUsage,
+    resync: resyncNativelyKeyInUse,
+    notify: (state) => {
+      BrowserWindow.getAllWindows().forEach((win) => {
+        if (!win.isDestroyed()) win.webContents.send('natively-pack-fallback-changed', state);
+      });
+    },
+    isPlaceholderKey: (key) => key === TRIAL_SENTINEL_KEY,
+  });
+  setNativelyPackFallback(packFallback);
+  onNativelyPlanLimit((limit) => { void packFallback.onPlanLimit(limit); });
+  void packFallback.start().catch((e: any) => console.warn('[PackFallback] start failed:', e?.message));
+
+  /** The pack key held beside the saved key, for the Plans & Billing row. Never the key itself. */
+  safeHandle('get-natively-pack-key', () => {
+    const { CredentialsManager } = require('./services/CredentialsManager');
+    const cm = CredentialsManager.getInstance();
+    const pack: string | undefined = cm.getNativelyPackApiKey();
+    const state = packFallback.state();
+    return {
+      ok: true,
+      held: !!pack,
+      last4: pack ? pack.slice(-4) : null,
+      inUse: state.inUse,
+      until: state.until,
+      stoppedEarly: state.stoppedEarly,
+    };
+  });
+
+  /**
+   * The pack key was removed while Pro came from a pack (2026-11-18): that Pro
+   * is not this app's any more. Its key is gone, so meetings no longer count
+   * its hours, and it would have lasted until the pack's last day. Pro moves to
+   * the key that is left when that key includes it (a plan with Pro, or itself
+   * a pack); otherwise the pack's licence goes and the Pro features stand down.
+   * A plan, lifetime or Dodo licence is never touched (licenceIsPack). Never throws.
+   */
+  const dropRemovedPackPro = async (cm: any): Promise<void> => {
+    try {
+      const { licenceIsPack } = require('./services/proAccess') as typeof import('./services/proAccess');
+      if (!licenceIsPack()) return;
+      const { LicenseManager } = require('../premium/electron/services/LicenseManager');
+      const lm = LicenseManager.getInstance();
+      const left: string | undefined = cm.getNativelyApiKey();
+      const moved = left && left !== TRIAL_SENTINEL_KEY
+        ? !!(await lm.activateWithApiKey(left).catch(() => null))?.success
+        : false;
+      if (!moved && licenceIsPack()) {
+        await lm.deactivate();
+        console.log('[IPC] pack key removed: the pack\'s Pro removed with it');
+        standDownIfNoPro('pack key removed');
+      }
+      proWatch.check();
+      const isPremium = licencePremiumForWindows();
+      BrowserWindow.getAllWindows().forEach((win) => {
+        if (!win.isDestroyed()) win.webContents.send('license-status-changed', { isPremium });
+      });
+    } catch (e: any) {
+      console.warn('[IPC] pack key removed: Pro check failed:', e?.message ?? e);
+    }
+  };
+
+  safeHandle('remove-natively-pack-key', async () => {
+    const { CredentialsManager } = require('./services/CredentialsManager');
+    const cm = CredentialsManager.getInstance();
+    const wasInUse = cm.isNativelyPackInUse();
+    if (!cm.setNativelyPackApiKey(null)) return { ok: false, error: 'credentials_unavailable' };
+    if (wasInUse) await resyncNativelyKeyInUse('pack key removed');
+    await dropRemovedPackPro(cm);
+    _usageCache.clear();
+    broadcastCredentialsChanged();
+    BrowserWindow.getAllWindows().forEach((win) => {
+      if (!win.isDestroyed()) win.webContents.send('natively-pack-fallback-changed', packFallback.state());
+    });
     return { ok: true };
   });
 
@@ -13249,9 +14020,14 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle('review:mark-shown', async () => {
     try {
-      const { ReviewService } = require('./services/ReviewService');
+      const { ReviewService, getReviewApiKey, getReviewHardwareId } = require('./services/ReviewService');
       const svc = ReviewService.getInstance();
       svc.markShown();
+      // The server stamps last_prompted_at, so prompt views can be counted
+      // against reviews and dismissals.
+      const apiKey = getReviewApiKey();
+      const hwid = await getReviewHardwareId();
+      svc.reportEvent(apiKey, hwid, { type: 'shown' }).catch(() => {});
       return { ok: true };
     } catch (error: any) {
       return { ok: false, error: error?.message || 'unknown' };
@@ -13271,6 +14047,23 @@ export function initializeIpcHandlers(appState: AppState): void {
       return { ok: false, error: error?.message || 'unknown' };
     }
   });
+
+  // The review ledger says the user reviewed (or said never): retire the review
+  // card in the card ledger at once and tell every window, so a card scheduled
+  // later this session does not ask again (mainLegacy.ts settleReviewCard).
+  const settleReviewCardNow = (state: unknown): void => {
+    try {
+      const { settleReviewCard } = require('./services/cards/mainLegacy');
+      const ledger = settleReviewCard(CardLedger.getInstance(), state as { has_reviewed?: boolean; dont_show_again?: boolean });
+      if (ledger) {
+        BrowserWindow.getAllWindows().forEach((win) => {
+          if (!win.isDestroyed()) win.webContents.send('cards:changed', ledger);
+        });
+      }
+    } catch (e: any) {
+      console.warn('[IPC] review card not retired in the card ledger:', e?.message);
+    }
+  };
 
   safeHandle('review:dismiss-forever', async () => {
     try {
@@ -13318,6 +14111,9 @@ export function initializeIpcHandlers(appState: AppState): void {
         svc.markReviewed(result.id);
         // Backend already records this server-side; the local call is redundant
         // but keeps the file in sync if the network blip happens after submit.
+        // A review left from About retires the review card now, not at the next
+        // launch's backend sync (which never comes offline).
+        settleReviewCardNow(svc.getLocalState());
       }
       return result;
     } catch (error: any) {
@@ -14003,6 +14799,11 @@ export function initializeIpcHandlers(appState: AppState): void {
           return { success: false, error: sttPersistError };
         }
 
+        // A Pro pack's Pro follows the AI and speech-to-text (packs/packProRule.ts).
+        // Before the rebuild: the provider is saved, so Pro follows it even if
+        // the rebuild below throws.
+        checkProNow();
+
         // Reconfigure the audio pipeline to use the new STT provider
         await appState.reconfigureSttProvider();
 
@@ -14502,7 +15303,10 @@ export function initializeIpcHandlers(appState: AppState): void {
               resolve(result);
             };
 
-            const ws = new WebSocket('wss://stt-rt.soniox.com/transcribe-websocket');
+            // Key in the upgrade header, not the config frame (refused there from 2027-01-15).
+            const ws = new WebSocket('wss://stt-rt.soniox.com/transcribe-websocket', {
+              headers: { Authorization: `Bearer ${apiKey}` },
+            });
 
             // Hard connect timeout — server unreachable
             const connectTimeout = setTimeout(() => {
@@ -14513,8 +15317,7 @@ export function initializeIpcHandlers(appState: AppState): void {
               clearTimeout(connectTimeout);
               ws.send(
                 JSON.stringify({
-                  api_key: apiKey,
-                  model: 'stt-rt-v5',
+                  model: require('./audio/sttModelCatalog').SONIOX_RT_MODEL,
                   audio_format: 'pcm_s16le',
                   sample_rate: 16000,
                   num_channels: 1,
@@ -15624,6 +16427,8 @@ export function initializeIpcHandlers(appState: AppState): void {
       }
 
       appState.sendModelChanged(modelId);
+      // A Pro pack's Pro follows the AI model (packs/packProRule.ts).
+      checkProNow();
 
       // Close the selector window if open
       appState.modelSelectorWindowHelper.hideWindow();
@@ -15714,6 +16519,8 @@ export function initializeIpcHandlers(appState: AppState): void {
       }
 
       appState.sendModelChanged(modelId);
+      // A Pro pack's Pro follows the AI model (packs/packProRule.ts).
+      checkProNow();
 
       // Close the selector window if open
       appState.modelSelectorWindowHelper.hideWindow();
@@ -15824,6 +16631,12 @@ export function initializeIpcHandlers(appState: AppState): void {
   });
 
   safeHandle('end-meeting', async () => {
+    // The first guide meeting's Stop waits out its 30 s (guideStopLockedMs).
+    const lockedMs = guideStopLockedMs();
+    if (lockedMs > 0) {
+      console.log(`[Guide] Stop held: ${Math.ceil(lockedMs / 1000)} s of the first meeting left`);
+      return { success: false, code: 'guide_stop_locked', lockedMs };
+    }
     try {
       await appState.endMeeting();
       return { success: true };
@@ -17511,16 +18324,15 @@ export function initializeIpcHandlers(appState: AppState): void {
   });
   // The offer on screen now, for a launcher that (re)loads while one is up.
   safeHandle('meeting-offer:current', async () => require('./services/meetingDetection/wireMeetingDetection').getMeetingOffers()?.view() ?? null);
-  // Calendar reminder lead time (Settings › Calendar): 1, 2 or 5 minutes. Unset = 2.
-  // Applies to reminders scheduled from the next calendar refresh, which this
-  // asks for at once.
+  // Calendar reminder lead time (Settings › Calendar): 1, 2 or 5 minutes, or
+  // 0 = Off. Unset = 2. The pending reminders are re-planned at once.
   safeHandle('get-calendar-reminder-minutes', async () => {
     const { reminderMinutes } = require('./services/meetingDetection/meetingOffer');
     return reminderMinutes(SettingsManager.getInstance().get('calendarReminderMinutes'));
   });
   safeHandle('set-calendar-reminder-minutes', async (_, minutes: number) => {
-    const { REMINDER_MINUTE_CHOICES } = require('./services/meetingDetection/meetingOffer');
-    if (!REMINDER_MINUTE_CHOICES.includes(minutes)) return { success: false };
+    const { REMINDER_SETTING_CHOICES } = require('./services/meetingDetection/meetingOffer');
+    if (!REMINDER_SETTING_CHOICES.includes(minutes)) return { success: false };
     if (!SettingsManager.getInstance().set('calendarReminderMinutes', minutes)) return { success: false, error: 'settings_store_degraded' };
     try { require('./services/CalendarManager').CalendarManager.getInstance().rescheduleReminders(); } catch { /* next refresh applies it */ }
     return { success: true };
@@ -17610,6 +18422,8 @@ export function initializeIpcHandlers(appState: AppState): void {
     const before = normalizeMeetingSurface(SettingsManager.getInstance().get('meetingSurface'));
     if (!SettingsManager.getInstance().set('meetingSurface', surface)) return { success: false, error: 'settings_store_degraded' };
     try { funnelTelemetry.meetingSurfaceSet(before, surface); } catch { /* analytics only */ }
+    // First-run guide step 7 asks for the notepad.
+    guideSurfaceSet(surface);
     return { success: true };
   });
   safeHandle('live-notes:get-state', async () => appState.getLiveNotes().getState());
@@ -20055,6 +20869,9 @@ export function initializeIpcHandlers(appState: AppState): void {
       try { _manualCodingState.clearAllSessions(); } catch { /* non-fatal */ }
 
       ModesManager.getInstance().setActiveMode(id);
+      // Speech Auto Answer holds for the next ask was heard under the old mode:
+      // it must not prefix the new mode's first question (F-CTX-03, 2026-11-13).
+      try { appState.onAutoAnswerModeChanged?.(); } catch { /* non-fatal */ }
       // Supersede in-flight LIVE answers too (the abort loop above only covers
       // manual chat streams): a WTA generation planned under the old mode must
       // not finalize into a UI now showing the new one.
@@ -20767,6 +21584,20 @@ export function initializeIpcHandlers(appState: AppState): void {
     } catch (e: any) {
       console.warn('[IPC] skills:delete error:', e?.message || e);
       return { success: false, error: e?.message || 'failed to delete skill' };
+    }
+  });
+
+  // "Use in every answer" (Settings › Skills, 2026-11-09). A switched-on skill
+  // rides every live and typed answer without its /name prefix: a skill only
+  // ever applied when typed, so one written to "answer in my voice" never
+  // reached a live answer.
+  safeHandle('skills:set-always-on', async (_evt, id: string, alwaysOn: boolean) => {
+    try {
+      if (typeof id !== 'string' || typeof alwaysOn !== 'boolean') return { success: false, error: 'invalid arguments' };
+      return SkillsManager.getInstance().setSkillAlwaysOn(id, alwaysOn);
+    } catch (e: any) {
+      console.warn('[IPC] skills:set-always-on error:', e?.message || e);
+      return { success: false, error: e?.message || 'failed to update skill' };
     }
   });
 

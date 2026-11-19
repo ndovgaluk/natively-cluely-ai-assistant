@@ -165,6 +165,14 @@ export interface BridgeInput {
    * "Profile and history" provider scope is off. See ComposeInput.userBio.
    */
   userBio?: string;
+  /**
+   * Facts from the active mode's Real-time prompt (ModesManager.getActiveModeUserNotes).
+   * Mode configuration, like realtimeInstruction, so no provider scope removes
+   * it. See ComposeInput.modeNotes.
+   */
+  modeNotes?: string;
+  /** "Use in every answer" skills (SkillsManager.getAlwaysOnPromptBlock). See ComposeInput.standingSkills. */
+  standingSkills?: string;
   /** The APP's per-turn length default — see ComposeInput.defaultLengthDirective. Never concatenate it onto realtimeInstruction. */
   defaultLengthDirective?: string;
   /**
@@ -275,6 +283,14 @@ export interface BridgeResult {
  * Never throws. A defect in the new path must degrade to legacy, never break a
  * live answer — the same contract the wired manual-chat surface uses.
  */
+/** Profile Intelligence ships in this build (premium present). Never throws; unknown = available. */
+function profileFeatureAvailable(): boolean {
+  try {
+    const { isPremiumAvailable } = require('../../premium/featureGate');
+    return isPremiumAvailable() !== false;
+  } catch { return true; }
+}
+
 export async function buildV3Prompt(input: BridgeInput): Promise<BridgeResult | null> {
   try {
     if (!isContextIntelligenceV3Enabled()) return null;
@@ -292,6 +308,20 @@ export async function buildV3Prompt(input: BridgeInput): Promise<BridgeResult | 
       userAnswerPolicy = getStoredAnswerPolicy(input.modeUniqueId ?? modeId);
     } catch { /* store unavailable — mode default applies */ }
     const policy = resolveModePolicy(modeId);
+
+    // The mode's source contract (F-ACC-05), read per turn like the Answer
+    // policy above, read-only (no migration write on the answer path).
+    let modeSourceContract: { sourceAuthority: string; origin: string } | null = null;
+    if (input.modeUniqueId) {
+      try {
+        const { ModesManager } = require('../../services/ModesManager');
+        const mode = ModesManager.getInstance().getModes().find((m: { id: string }) => m.id === input.modeUniqueId);
+        const c = mode?.sourceContract;
+        if (c && typeof c.sourceAuthority === 'string' && typeof c.origin === 'string') {
+          modeSourceContract = { sourceAuthority: c.sourceAuthority, origin: c.origin };
+        }
+      } catch { /* modes store unavailable — mode policy alone */ }
+    }
 
     const req: AnswerRequest = {
       requestId: input.requestId ?? `v3-${input.surface}-${Date.now()}`,
@@ -324,6 +354,7 @@ export async function buildV3Prompt(input: BridgeInput): Promise<BridgeResult | 
       attachedFileNames: input.attachedFileNames,
       screenText: input.screenText,
       extraAllowedSourceTypes: input.extraAllowedSourceTypes,
+      modeSourceContract,
       keepConversationState: input.keepConversationState,
     };
 
@@ -607,6 +638,8 @@ export async function buildV3Prompt(input: BridgeInput): Promise<BridgeResult | 
       realtimeInstruction: input.realtimeInstruction,
       defaultLengthDirective: input.defaultLengthDirective,
       userBio,
+      modeNotes: input.modeNotes,
+      standingSkills: input.standingSkills,
       diagramTurn,
       conversationSummary: convoSummary,
       // What-to-answer answers the OTHER person's question: their "I" is theirs.
@@ -620,6 +653,9 @@ export async function buildV3Prompt(input: BridgeInput): Promise<BridgeResult | 
       conversationHasScreenObservation: historyCarriesScreenText && Boolean(convoSummary),
       attachedSourceCount: input.attachedSourceCount,
       profileSourceCount: input.profileSourceCount,
+      // F-ACC-14: the source-available build has no Profile Intelligence; its
+      // no-evidence wording must not send the user there.
+      profileFeatureAvailable: profileFeatureAvailable(),
       // Defect D (2026-08-01): the CLARIFICATION verdict was computed and then
       // dropped here — the composer is the only place it can act.
       fallbackUsed: result.trace.fallbackUsed,
@@ -704,6 +740,8 @@ export async function buildV3Prompt(input: BridgeInput): Promise<BridgeResult | 
         attachedFiles: input.attachedSourceCount ?? null,
         modeAttachedFiles: input.attachedSourceCount ?? null,
         profileSources: input.profileSourceCount ?? 0,
+        // F-ACC-14: 'not_in_build' = source-available build, no profile can exist.
+        profileFeature: profileFeatureAvailable() ? 'available' : 'not_in_build',
         profileResumeSources: (input.resolvedProfileSources ?? []).filter((s) => s.role === 'profile_resume').length,
         profileJobDescriptionSources: (input.resolvedProfileSources ?? []).filter((s) => s.role === 'profile_job_description').length,
         profileFactSources: (input.resolvedProfileSources ?? []).filter((s) => s.role === 'profile_fact').length,

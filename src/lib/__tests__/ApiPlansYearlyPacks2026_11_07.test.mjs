@@ -34,10 +34,10 @@ test('yearly is ten months of the monthly price on every tier', () => {
   assert.equal(apiPlanPrice('nope', 'yearly'), null);
 });
 
-test('the packs match the server catalog: Light $5 2 h / 7 d, Heavy $10 5 h / 14 d', () => {
+test('the packs match the server catalog: Light $5 2 h / 2 d, Heavy $10 5 h / 5 d (2026-11-16)', () => {
   assert.deepEqual(PRO_PACKS.map((p) => [p.id, p.name, p.price, p.hours, p.days]), [
-    ['pack_light', 'Light pack', 5, 2, 7],
-    ['pack_heavy', 'Heavy pack', 10, 5, 14],
+    ['pack_light', 'Light pack', 5, 2, 2],
+    ['pack_heavy', 'Heavy pack', 10, 5, 5],
   ]);
 });
 
@@ -122,13 +122,23 @@ test('the Plans tab reads every checkout link from CHECKOUT_URLS, none hardcoded
 test('Monthly is the default; a yearly key opens on Yearly and only matches Yearly', () => {
   assert.match(settingsCode, /usageCache\?\.billing_period === 'yearly' \? 'yearly' : 'monthly'/);
   assert.match(settingsCode, /keyCycle === billingCycle/);
-  // The switch is bound to billingCycle and its onChange still sets it (it
-  // also tells plans_visit the person switched, 2026-11-09).
-  assert.match(settingsCode, /<BillingCycleSwitch value=\{billingCycle\} onChange=\{\(next\) => \{ plansVisit\.cycleSwitched\(next\); setBillingCycle\(next\); \}\} showNote=\{false\} align="start" \/>/);
+  // The switch is Hourly | Monthly | Yearly (2026-11-10): Monthly and Yearly
+  // still set billingCycle and tell plans_visit the person switched; Hourly
+  // shows the packs in the plans' place.
+  assert.match(settingsCode, /<BillingCycleSwitch value=\{plansView\} onChange=\{choosePlansView\} options=\{PLANS_VIEWS\} showNote=\{false\} align="start" \/>/);
+  assert.match(settingsCode, /plansVisit\.cycleSwitched\(next\);\s*setBillingCycle\(next\);/);
+  assert.match(settingsCode, /const \[packsView, setPacksView\] = useState<boolean>\(\(\) => isPackPlan\(usageCache\?\.plan\)\)/);
+  assert.match(settingsCode, /\{packsView \? \([\s\S]*?<ProPacks [\s\S]*?\) : \([\s\S]*?<PlanRail>/);
+  const views = stripComments(read('components/ui/BillingCycleSwitch.tsx'));
+  assert.match(views, /\{ id: 'hourly', label: 'Hourly' \},\s*\.\.\.BILLING_CYCLES/);
   const sw = stripComments(read('components/ui/BillingCycleSwitch.tsx'));
   assert.match(sw, /role="radiogroup"[\s\S]*?aria-label="Billing"/);
   assert.ok(sw.includes('surface-switch'), "Overlay's two-way switch, not a new control");
+  // Yearly: the monthly share and the yearly total take turns in one cell
+  // (2026-11-16), so a plan card matches the packs' height.
   assert.ok(settingsCode.includes("{yearly ? '/ year' : '/ month'}"));
+  assert.ok(settingsCode.includes("[['month', yearlyPerMonth, '/ month'], ['year', plan.yearlyPrice, '/ year']]"));
+  assert.match(settingsCode, /setYearlyFace\(\(f\) => \(f === 'month' \? 'year' : 'month'\)\)/);
 });
 
 test('the odometer takes three-digit prices: $150, $250, $350', () => {

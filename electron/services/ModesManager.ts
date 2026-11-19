@@ -7,7 +7,7 @@ import { ModeContextRetriever, RETRY_ELIGIBLE_INDEX_STATUSES, type ModeRetrieval
 import type { ModeRetrievedContext as HybridContext } from './modes/ModeHybridRetriever';
 import type { AnswerType } from '../llm/AnswerPlanner';
 import type { ActiveModeInfo } from '../llm/modeProfiles';
-import { classifyCustomContext, selectCustomContextForAnswer } from '../llm/customContextClassifier';
+import { classifyCustomContext, selectCustomContextFactsForAnswer, selectCustomContextForAnswer } from '../llm/customContextClassifier';
 import { registerUserInstructionProvider, USER_INSTRUCTIONS_MAX_CHARS } from '../llm/userInstructionContract';
 import { diagLog } from '../llm/documentGroundedPrompt';
 import { planBuiltinAdoption, BUILTIN_MODE_LABELS } from './builtinModes';
@@ -802,9 +802,9 @@ export class ModesManager {
                 sortOrder: i,
             });
         });
-        // Compile extraction instructions for all seeded sections in parallel (fire-and-forget,
-        // bounded concurrency). Never blocks mode creation / UI.
-        this.compileAllSectionsAsync(id);
+        // No AI compile for seeded sections (2026-11-16): they are built-in text, and their
+        // instructions ship with the app (meeting/sectionInstructions.ts). Compiling them here
+        // was 56 calls at first launch, before the user had started anything.
         return {
             id,
             name: params.name,
@@ -1459,6 +1459,9 @@ export class ModesManager {
         // If the section's meaning changed (title/description), recompile its instruction.
         // Skip when we are only writing the compiledPrompt itself (avoids a loop).
         if ((updates.title !== undefined || updates.description !== undefined) && updates.compiledPrompt === undefined) {
+            // The stored instruction was written for the old text: clear it, so a failed or
+            // skipped recompile falls back to the new description, not the old instruction.
+            DatabaseManager.getInstance().updateNoteSection(id, { compiledPrompt: '' });
             const owner = DatabaseManager.getInstance().getNoteSectionOwnerMode(id);
             if (owner) {
                 this.compileSectionPromptAsync(id, owner.modeId, updates.title ?? owner.title, updates.description ?? owner.description);
@@ -1478,6 +1481,10 @@ export class ModesManager {
     private compileSectionPromptAsync(sectionId: string, modeId: string, title: string, description: string): void {
         void (async () => {
             try {
+                // Built-in text (a default section re-added, an edit undone) has a shipped
+                // instruction that wins at read time: an AI compile would be wasted.
+                const { builtinSectionInstruction } = require('./meeting/sectionInstructions');
+                if (builtinSectionInstruction(title, description)) return;
                 const llmHelper = ModesManager.llmHelperForCompiler;
                 if (!llmHelper || !llmHelper.hasAnyConfiguredProvider?.()) return; // compiler not available or no provider configured
                 // Scope gate: never call a cloud LLM for prompt compilation when post_call_summary
@@ -1489,58 +1496,19 @@ export class ModesManager {
                 } catch { /* default allow */ }
                 const mode = this.getModes().find(m => m.id === modeId);
                 const { SectionPromptCompiler } = require('./meeting/SectionPromptCompiler');
-                const { instruction, compiled } = await new SectionPromptCompiler(llmHelper).compile({
+                // Background lane: a compile never makes the live judge or answer
+                // wait on the provider's rate limiter (F-LAT-06).
+                const { runAsBackgroundLlmWork } = require('./RateLimiter');
+                const { instruction, compiled } = await runAsBackgroundLlmWork(() => new SectionPromptCompiler(llmHelper).compile({
                     sectionTitle: title,
                     sectionDescription: description,
                     meetingMode: mode?.templateType,
-                });
+                }));
                 if (compiled && instruction) {
                     DatabaseManager.getInstance().updateNoteSection(sectionId, { compiledPrompt: instruction });
                 }
             } catch (e) {
                 console.warn('[ModesManager] section prompt compile skipped (non-fatal):', (e as any)?.message);
-            }
-        })();
-    }
-
-    /**
-     * Compile extraction instructions for EVERY section of a mode, in parallel with bounded
-     * concurrency. Used when a custom mode is created (many sections at once). Fire-and-forget.
-     */
-    public compileAllSectionsAsync(modeId: string): void {
-        void (async () => {
-            try {
-                // Yield one macrotask before reading provider state. Built-in seeding runs inside
-                // AppState.getInstance(), BEFORE loadStoredCredentials() in the same synchronous
-                // stretch of initializeApp, so a packaged build has no keys loaded yet. Checking
-                // now would permanently skip every seeded section for users who DO have keys
-                // (a release that adds a built-in template, an upgrade from before built-ins
-                // existed, or a rebuilt DB whose stored keys survived).
-                await new Promise<void>(resolve => setImmediate(resolve));
-                const llmHelper = ModesManager.llmHelperForCompiler;
-                if (!llmHelper || !llmHelper.hasAnyConfiguredProvider?.()) return;
-                try {
-                    const { SettingsManager } = require('./SettingsManager');
-                    if (SettingsManager.getInstance().get('providerDataScopes')?.post_call_summary === false) return;
-                } catch { /* default allow */ }
-                const mode = this.getModes().find(m => m.id === modeId);
-                const sections = this.getNoteSections(modeId).filter(s => !s.compiledPrompt || !s.compiledPrompt.trim());
-                if (sections.length === 0) return;
-                const { SectionPromptCompiler } = require('./meeting/SectionPromptCompiler');
-                const compiler = new SectionPromptCompiler(llmHelper);
-                const CONCURRENCY = 3;
-                let next = 0;
-                await Promise.all(Array.from({ length: Math.min(CONCURRENCY, sections.length) }, async () => {
-                    while (next < sections.length) {
-                        const s = sections[next++];
-                        try {
-                            const { instruction, compiled } = await compiler.compile({ sectionTitle: s.title, sectionDescription: s.description, meetingMode: mode?.templateType });
-                            if (compiled && instruction) DatabaseManager.getInstance().updateNoteSection(s.id, { compiledPrompt: instruction });
-                        } catch { /* per-section non-fatal */ }
-                    }
-                }));
-            } catch (e) {
-                console.warn('[ModesManager] compileAllSections skipped (non-fatal):', (e as any)?.message);
             }
         })();
     }
@@ -1566,12 +1534,12 @@ export class ModesManager {
      * The mode's notes sections become a note template's (2026-10-21, "Use a
      * template" in the Modes Manager): the mode's default notes layout, which
      * a template picked in the notepad still overrides for one meeting. The
-     * sections compile like a new mode's. Null when the write failed.
+     * sections are built-in text, so their instructions ship with the app
+     * (meeting/sectionInstructions.ts): no AI compile. Null when the write failed.
      */
     public replaceNoteSectionsWith(modeId: string, sections: ReadonlyArray<{ title: string; description: string }>): ModeNoteSection[] | null {
         const rows = sections.map(s => ({ id: `ns_${crypto.randomUUID()}`, title: s.title, description: s.description }));
         if (!DatabaseManager.getInstance().replaceNoteSections(modeId, rows)) return null;
-        this.compileAllSectionsAsync(modeId);
         return this.getNoteSections(modeId);
     }
 
@@ -1660,6 +1628,30 @@ export class ModesManager {
             ? selectCustomContextForAnswer(classifyCustomContext(raw), answerType).included.map(c => c.text).join('\n')
             : raw;
         let text = scoped.trim();
+        if (text.length > ModesManager.PINNED_INSTRUCTIONS_MAX_CHARS) {
+            text = text.slice(0, ModesManager.PINNED_INSTRUCTIONS_MAX_CHARS) + ' …[truncated]';
+        }
+        return text;
+    }
+
+    /**
+     * The facts the user wrote in the active mode's Real-time prompt (who they
+     * are, their work, their product), for the prompt's "notes the user wrote"
+     * data section. getActiveModePinnedInstructions carries the same text on
+     * the instruction channel, which binds presentation only and tells the
+     * model a fact there is no instruction; this is where those facts are read
+     * as the user's own words. Answer-type gated like the rest of the text (see
+     * selectCustomContextFactsForAnswer); empty for a strictly
+     * document-grounded mode, whose answers come from its files.
+     */
+    public getActiveModeUserNotes(answerType?: AnswerType, pinnedModeId?: string): string {
+        const mode = this.resolveMode(pinnedModeId);
+        if (!mode) return '';
+        const raw = (mode.customContext || '').trim();
+        if (!raw) return '';
+        if (this.getActiveModeDocumentGroundingInfo(pinnedModeId).strictDocumentGroundedActive) return '';
+        let text = selectCustomContextFactsForAnswer(classifyCustomContext(raw), answerType)
+            .map(c => c.text).join('\n').trim();
         if (text.length > ModesManager.PINNED_INSTRUCTIONS_MAX_CHARS) {
             text = text.slice(0, ModesManager.PINNED_INSTRUCTIONS_MAX_CHARS) + ' …[truncated]';
         }
@@ -1871,7 +1863,10 @@ export class ModesManager {
                 if (hybridResult && !hybridResult.usedFallback && hybridResult.formattedContext) {
                     return hybridResult.formattedContext;
                 }
-                // Hybrid unavailable — fall back to lexical + identity block.
+                // Hybrid unavailable — fall back to the legacy lexical scorer
+                // (identity block included). Said plainly (F-ACC-06, 2026-11-13):
+                // this block is the legacy scorer's, not a hybrid one.
+                console.info(`[ModesManager] document-grounded retrieval is lexical-only this turn (${hybridResult?.degradedReason ?? 'no semantic arm'}); using the legacy lexical block`);
                 return this.buildRetrievedActiveModeContextBlock(
                     query, transcript, tokenBudget, answerType, excludeCustomContext, pinnedModeId, retrievalOptions,
                 );

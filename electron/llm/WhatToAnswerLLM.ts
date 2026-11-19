@@ -14,9 +14,9 @@ import { assemblePromptV2 } from "../intelligence/PromptAssemblerV2";
 import { beginTrace, commitTrace } from "../intelligence/IntelligenceTrace";
 import { DOM_CONTEXT_MAX_CHARS } from "../config/constants";
 import { checkAnswerForCodeBugs } from "./CodeSanityCheck";
-import { accountOrSetupUserMessage, providerRejectionUserMessage } from "./providerErrorClassifier";
+import { accountOrSetupUserMessage, isProvidersExhaustedError, providerFailureUserMessage, providerRejectionUserMessage } from "./providerErrorClassifier";
 import { formatAnswerPlanForPrompt, isCodingAnswerType } from "./AnswerPlanner";
-import { resolveCodingPromptSignals, isDeicticAsk, isPromotedScreenCodingTurn, screenPromotedCodingSignals } from "./codingPromptSignals";
+import { resolveCodingPromptSignals, isDeicticAsk, isPromotedScreenCodingTurn, isRepeatPressAsk, screenPromotedCodingSignals } from "./codingPromptSignals";
 import type { AnswerPlan, AnswerType } from "./AnswerPlanner";
 import { isLayerAllowed } from "./contextRoute";
 import { deriveRetrievalQuery } from "./retrievalQueryPolicy";
@@ -351,7 +351,9 @@ ${promptInstruction.trim()}
             // "Explain this" / "what's the complexity" over a screenshot is
             // promoted too, and this directive used to override their shape
             // with the full solution.
-            if (promotedScreenCodingTurn && codingSignals.codingShape === 'solve') {
+            // The shape alone is not enough: `solve` is also the default for a
+            // real question that matched no narrower shape (#742).
+            if (promotedScreenCodingTurn && isRepeatPressAsk(answerPlan?.question, codingSignals.codingShape)) {
                 intentContextParts.push(`<repeat_press_directive>
 The user triggered this action with a coding problem on screen and NO new question. That is a request for the COMPLETE solution to the on-screen problem, in the shape the coding contract asks for, even if a previous answer in this conversation already covered it, and even if this looks like a follow-up. Never respond with commentary on, agreement with, or a summary of an earlier answer. Produce the answer as if asked for the first time.
 </repeat_press_directive>`);
@@ -582,6 +584,12 @@ The user triggered this action with a coding problem on screen and NO new questi
                             (_cog as any).resolutionStrategy = resolution.strategy;
                             modeContextBlock = resolution.pack.items.map((item) => `[Section: ${item.pointer?.section || item.sourceId}]\n${item.text}`).join('\n\n');
                         } else {
+                        // F-LAT-05 (2026-11-13): a V3-composed turn sends `_v3p.user`
+                        // INSTEAD of the legacy packet (see _wtaUserBase below), so the
+                        // block retrieved here is discarded unread — yet it was awaited
+                        // first (prefetch race ≤1.5 s, inline hybrid ≤1.5 s / doc-grounded
+                        // longer). Retrieve nothing on that turn; legacy turns are unchanged.
+                        const v3ComposedTurn = Boolean((requestSnapshot as any)?.v3Prompt);
                         // PI v3 (W5): prefer the caller's PREFETCHED retrieval
                         // (kicked in parallel with intent classification +
                         // grounding) — by the time we get here it has usually
@@ -589,7 +597,9 @@ The user triggered this action with a coding problem on screen and NO new questi
                         // race as the inline path so a cold embedder still can't
                         // stall first-token. Falls through to inline retrieval
                         // when no prefetch was supplied (manual path, tests).
-                        if (preFetchedModeContext && !forceDocumentGrounding) {
+                        if (v3ComposedTurn) {
+                            // nothing to retrieve: the V3 prompt carries its own evidence
+                        } else if (preFetchedModeContext && !forceDocumentGrounding) {
                             const { value, timedOut } = await raceWithBudget(
                                 preFetchedModeContext, HYBRID_RETRIEVAL_BUDGET_MS, '',
                             );
@@ -629,7 +639,7 @@ The user triggered this action with a coding problem on screen and NO new questi
                                 console.warn(`[WhatToAnswerLLM] hybrid retrieval exceeded ${HYBRID_RETRIEVAL_BUDGET_MS}ms — using lexical fallback`);
                             }
                         }
-                        if (!modeContextBlock) {
+                        if (!modeContextBlock && !v3ComposedTurn) {
                             // excludeCustomContext (PI v3 W2): the mode's
                             // customContext is PINNED below — keep retrieval to
                             // reference files only so the text never ships twice.
@@ -889,8 +899,23 @@ The user triggered this action with a coding problem on screen and NO new questi
                         hasAttachedImages,
                         hasScreenText,
                     });
+                    // F-ACC-13 (2026-11-13): this is the null-V3 fallback's decline
+                    // site, and the engine marks its doc-grounded context
+                    // `govern: true` without asking the refusal policy. Ask it here,
+                    // as the coordinator and manual chat do: a refusal pack that
+                    // does not govern falls through to the model exactly like the
+                    // visual-context yield (no canned line, no pack rendering).
+                    const { packGovernsGeneration } = require('../intelligence/context-os/refusalPolicy') as typeof import('../intelligence/context-os/refusalPolicy');
+                    const _refusalYields = pack.answerPolicy === 'refuse_insufficient_evidence'
+                        && !packGovernsGeneration({
+                            answerPolicy: pack.answerPolicy,
+                            sourceAuthority: _cog.modeSnapshot?.sourceAuthority ?? null,
+                            hasReferenceFiles: true,
+                        });
                     if (_declineYields) {
                         console.log('[CONTEXT-OS] text-evidence decline yields to current-screen context — answering from visual evidence');
+                    } else if (_refusalYields) {
+                        console.log('[CONTEXT-OS] refusal pack does not govern (refusal policy) — answering with the model');
                     } else {
                     if (pack.answerPolicy === 'ask_clarification') {
                         // contract.reason is a developer diagnostic (e.g. "sourceAuthority=
@@ -1151,7 +1176,22 @@ The user triggered this action with a coding problem on screen and NO new questi
             // own section; the v2 envelope and the legacy packet get it appended
             // (never twice — see withDiagramTurnBlock).
             const _wtaUserBase = _v3p?.user ?? _v2TurnUser ?? packet.userMessage;
-            const _wtaUserMessage = _v3p ? _wtaUserBase : withDiagramTurnBlock(_wtaUserBase, diagramTurn);
+            // What the user told the app about themselves (2026-11-09): the V3
+            // composer carries About you, the mode's Real-time prompt facts and
+            // "Use in every answer" skills; the v2 envelope and the legacy packet
+            // carried none, so with V3 off or failed a live answer invented the
+            // user's background. Appended last, where the composer puts them.
+            const _personalBlock = _v3p ? '' : (() => {
+                try {
+                    return (require('../services/answerPersonalContext') as typeof import('../services/answerPersonalContext')).personalContextBlockForAnswers({
+                        answerType: answerPlan?.answerType,
+                        modeId: requestSnapshot?.modeUniqueId ?? null,
+                        explicitSkillId: activeSkill?.id ?? null,
+                    });
+                } catch { return ''; }
+            })();
+            const _wtaLegacyUser = _personalBlock ? `${_wtaUserBase}\n\n${_personalBlock}` : _wtaUserBase;
+            const _wtaUserMessage = _v3p ? _wtaUserBase : withDiagramTurnBlock(_wtaLegacyUser, diagramTurn);
             // PR #429 Bug 003: `_v3p?.system ?? finalPromptOverride` discarded the
             // ACTIVE SKILL block on every V3 turn — finalPromptOverride is its only
             // carrier and V3 is default ON, so `??` never fell through.
@@ -1326,6 +1366,10 @@ The user triggered this action with a coding problem on screen and NO new questi
             // below would name the wrong cause. Checked first: "quota" and
             // "API key" in these would otherwise match the provider test.
             const ownLine = accountOrSetupUserMessage(error);
+            // Every configured provider was tried and failed (F-ACC-10): say so,
+            // and do not hand the engine an empty stream to regenerate against
+            // a chain that has just failed end to end.
+            const exhaustedLine = isProvidersExhaustedError(error) ? providerFailureUserMessage(error) : null;
             const isProviderFailure = /\b(401|403|429)\b|api key|unauthor|forbidden|quota|rate.?limit|billing|exhausted|permission/.test(msg);
             // A permanent rejection ("The '<model>' model is not supported when
             // using Codex with a ChatGPT account", issue #543) is not retryable:
@@ -1334,6 +1378,8 @@ The user triggered this action with a coding problem on screen and NO new questi
             const rejection = isProviderFailure ? null : providerRejectionUserMessage(error);
             if (ownLine) {
                 yield ownLine;
+            } else if (exhaustedLine) {
+                yield exhaustedLine;
             } else if (rejection) {
                 yield rejection;
             } else if (isProviderFailure) {
